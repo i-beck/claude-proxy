@@ -148,6 +148,11 @@ fn extract_backend_error_message(raw: &str) -> String {
                 return message.to_string();
             }
         }
+        // JSON parsed but contains no recognizable error message.
+        // For an empty object {}, return a generic message rather than "{}".
+        if parsed.as_object().is_some_and(|obj| obj.is_empty()) {
+            return "Unknown backend error".to_string();
+        }
     }
 
     let message = raw.trim();
@@ -331,6 +336,7 @@ fn default_document_filename(media_type: &str) -> String {
             let extension = media_type
                 .rsplit('/')
                 .next()
+                .filter(|_| media_type.contains('/'))
                 .map(|part| {
                     part.chars()
                         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -873,10 +879,6 @@ pub async fn messages(
 ) -> Result<Response, (StatusCode, &'static str)> {
     let request_start = SystemTime::now();
 
-    // Count input tokens
-    let input_token_count = count_input_tokens(&cr.messages, &cr.system, &cr.tools);
-    log::debug!("📊 Input tokens: {}", input_token_count);
-
     // Determine streaming mode — default to true (Claude Code always streams)
     let client_wants_stream = cr.stream.unwrap_or(true);
     if !client_wants_stream {
@@ -993,6 +995,10 @@ pub async fn messages(
     if cr.service_tier.is_some() {
         log::debug!("ℹ️  'service_tier' accepted for compatibility but not forwarded to backend");
     }
+
+    // Count input tokens (after validation to avoid tokenizing oversized payloads)
+    let input_token_count = count_input_tokens(&cr.messages, &cr.system, &cr.tools);
+    log::debug!("📊 Input tokens: {}", input_token_count);
 
     // Debug: Log incoming headers (names only)
     log::debug!("📥 Incoming headers:");
@@ -3206,4 +3212,953 @@ mod tests {
             .unwrap()
             .contains("Attached document URL (unknown): https://example.com/file.pdf"));
     }
+
+    // ========================================================================
+    // anthropic_error_type — cover all status code branches
+    // ========================================================================
+    #[test]
+    fn test_anthropic_error_type_bad_request() {
+        assert_eq!(anthropic_error_type(StatusCode::BAD_REQUEST), "invalid_request_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_unauthorized() {
+        assert_eq!(anthropic_error_type(StatusCode::UNAUTHORIZED), "authentication_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_forbidden() {
+        assert_eq!(anthropic_error_type(StatusCode::FORBIDDEN), "permission_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_not_found() {
+        assert_eq!(anthropic_error_type(StatusCode::NOT_FOUND), "not_found_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_payload_too_large() {
+        assert_eq!(anthropic_error_type(StatusCode::PAYLOAD_TOO_LARGE), "request_too_large");
+    }
+    #[test]
+    fn test_anthropic_error_type_too_many_requests() {
+        assert_eq!(anthropic_error_type(StatusCode::TOO_MANY_REQUESTS), "rate_limit_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_service_unavailable() {
+        assert_eq!(anthropic_error_type(StatusCode::SERVICE_UNAVAILABLE), "overloaded_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_internal_server_error() {
+        assert_eq!(anthropic_error_type(StatusCode::INTERNAL_SERVER_ERROR), "api_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_bad_gateway() {
+        assert_eq!(anthropic_error_type(StatusCode::BAD_GATEWAY), "api_error");
+    }
+    #[test]
+    fn test_anthropic_error_type_other_client_error() {
+        assert_eq!(anthropic_error_type(StatusCode::CONFLICT), "invalid_request_error");
+    }
+
+    // ========================================================================
+    // maybe_error_response — streaming vs non-streaming
+    // ========================================================================
+    #[test]
+    fn test_maybe_error_response_stream_returns_err_tuple() {
+        let result = maybe_error_response(true, StatusCode::BAD_REQUEST, "empty", "invalid_request_error", "msg");
+        assert!(result.is_err());
+        let (status, code) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "empty");
+    }
+    #[test]
+    fn test_maybe_error_response_non_stream_returns_json_response() {
+        let result = maybe_error_response(false, StatusCode::BAD_REQUEST, "empty", "invalid_request_error", "msg");
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ========================================================================
+    // extract_backend_error_message — edge cases
+    // ========================================================================
+    #[test]
+    fn test_extract_backend_error_message_empty_json_object() {
+        // "{}" parses but has no error/message fields → falls through to raw.trim() = "{}"
+        assert_eq!(extract_backend_error_message("{}"), "{}");
+    }
+    #[test]
+    fn test_extract_backend_error_message_error_with_type_fallback() {
+        let msg = extract_backend_error_message(r#"{"error":{"type":"some_error_type"}}"#);
+        assert_eq!(msg, "some_error_type");
+    }
+    #[test]
+    fn test_extract_backend_error_message_top_level_message() {
+        let msg = extract_backend_error_message(r#"{"message":"direct message"}"#);
+        assert_eq!(msg, "direct message");
+    }
+    #[test]
+    fn test_extract_backend_error_message_empty_error_message() {
+        let msg = extract_backend_error_message(r#"{"error":{"message":"  "}}"#);
+        // trimmed message is empty, falls through to raw trim
+        assert_eq!(msg, r#"{"error":{"message":"  "}}"#);
+    }
+    #[test]
+    fn test_extract_backend_error_message_non_json_raw() {
+        assert_eq!(extract_backend_error_message("plain text error"), "plain text error");
+    }
+    #[test]
+    fn test_extract_backend_error_message_empty_raw() {
+        assert_eq!(extract_backend_error_message(""), "Unknown backend error");
+    }
+    #[test]
+    fn test_extract_backend_error_message_whitespace_only_raw() {
+        assert_eq!(extract_backend_error_message("   "), "Unknown backend error");
+    }
+
+    // ========================================================================
+    // content_uses_cache_control — non-array content
+    // ========================================================================
+    #[test]
+    fn test_content_uses_cache_control_non_array_returns_false() {
+        assert!(!content_uses_cache_control(&json!("plain string")));
+        assert!(!content_uses_cache_control(&json!(42)));
+        assert!(!content_uses_cache_control(&json!(null)));
+    }
+
+    // ========================================================================
+    // append_non_stream_text_content — None and non-string/non-array
+    // ========================================================================
+    #[test]
+    fn test_append_non_stream_text_content_none() {
+        let mut blocks = Vec::new();
+        append_non_stream_text_content(&mut blocks, None);
+        assert!(blocks.is_empty());
+    }
+    #[test]
+    fn test_append_non_stream_text_content_string() {
+        let mut blocks = Vec::new();
+        append_non_stream_text_content(&mut blocks, Some(&json!("hello")));
+        assert_eq!(blocks, vec![json!({"type": "text", "text": "hello"})]);
+    }
+    #[test]
+    fn test_append_non_stream_text_content_number_ignored() {
+        let mut blocks = Vec::new();
+        append_non_stream_text_content(&mut blocks, Some(&json!(42)));
+        assert!(blocks.is_empty());
+    }
+    #[test]
+    fn test_append_non_stream_text_content_empty_text_skipped() {
+        let mut blocks = Vec::new();
+        append_non_stream_text_content(&mut blocks, Some(&json!("")));
+        assert!(blocks.is_empty());
+    }
+    #[test]
+    fn test_append_non_stream_text_content_array_with_string_items() {
+        let mut blocks = Vec::new();
+        append_non_stream_text_content(&mut blocks, Some(&json!(["first", "second"])));
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], json!({"type": "text", "text": "first"}));
+        assert_eq!(blocks[1], json!({"type": "text", "text": "second"}));
+    }
+    #[test]
+    fn test_append_non_stream_text_content_array_with_empty_strings() {
+        let mut blocks = Vec::new();
+        append_non_stream_text_content(&mut blocks, Some(&json!(["", ""])));
+        assert!(blocks.is_empty());
+    }
+
+    // ========================================================================
+    // compact_preview
+    // ========================================================================
+    #[test]
+    fn test_compact_preview_short_text() {
+        assert_eq!(compact_preview("hello", 100), "hello");
+    }
+    #[test]
+    fn test_compact_preview_collapses_whitespace() {
+        assert_eq!(compact_preview("hello   world", 100), "hello world");
+    }
+    #[test]
+    fn test_compact_preview_truncates_long_text() {
+        let long = "x".repeat(200);
+        let result = compact_preview(&long, 50);
+        assert_eq!(result.chars().count(), 53); // 50 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+    #[test]
+    fn test_compact_preview_empty() {
+        assert_eq!(compact_preview("", 100), "");
+    }
+    #[test]
+    fn test_compact_preview_exact_length() {
+        assert_eq!(compact_preview("hello", 5), "hello");
+    }
+
+    // ========================================================================
+    // extract_text_preview
+    // ========================================================================
+    #[test]
+    fn test_extract_text_preview_string() {
+        assert_eq!(extract_text_preview(&json!("hello")), Some("hello".into()));
+    }
+    #[test]
+    fn test_extract_text_preview_array_with_text_blocks() {
+        let val = json!([{"text": "first"}, {"text": "second"}, {"text": "third"}, {"text": "fourth"}]);
+        // takes only first 3
+        assert_eq!(extract_text_preview(&val), Some("first second third".into()));
+    }
+    #[test]
+    fn test_extract_text_preview_array_empty() {
+        assert_eq!(extract_text_preview(&json!([])), None);
+    }
+    #[test]
+    fn test_extract_text_preview_array_with_empty_strings() {
+        assert_eq!(extract_text_preview(&json!(["", ""])), None);
+    }
+    #[test]
+    fn test_extract_text_preview_object_with_query() {
+        assert_eq!(extract_text_preview(&json!({"query": "search term"})), Some("search term".into()));
+    }
+    #[test]
+    fn test_extract_text_preview_object_with_url() {
+        assert_eq!(extract_text_preview(&json!({"url": "https://example.com"})), Some("https://example.com".into()));
+    }
+    #[test]
+    fn test_extract_text_preview_object_with_nested_content() {
+        assert_eq!(extract_text_preview(&json!({"content": "nested text"})), Some("nested text".into()));
+    }
+    #[test]
+    fn test_extract_text_preview_number() {
+        assert_eq!(extract_text_preview(&json!(42)), None);
+    }
+    #[test]
+    fn test_extract_text_preview_null() {
+        assert_eq!(extract_text_preview(&json!(null)), None);
+    }
+
+    // ========================================================================
+    // unsupported_content_block_text — type inference from JSON variant
+    // ========================================================================
+    #[test]
+    fn test_unsupported_content_block_text_with_name() {
+        let item = json!({"type": "custom", "name": "my_tool"});
+        let text = unsupported_content_block_text(&item);
+        assert!(text.contains("[Unsupported Claude content block: custom"));
+        assert!(text.contains("(my_tool)"));
+    }
+    #[test]
+    fn test_unsupported_content_block_text_with_tool_name() {
+        let item = json!({"type": "custom", "tool_name": "other_tool"});
+        let text = unsupported_content_block_text(&item);
+        assert!(text.contains("(other_tool)"));
+    }
+    #[test]
+    fn test_unsupported_content_block_text_array_type() {
+        let item = json!([1, 2, 3]);
+        let text = unsupported_content_block_text(&item);
+        assert!(text.contains("[Unsupported Claude content block: array]"));
+    }
+    #[test]
+    fn test_unsupported_content_block_text_object_without_type() {
+        let item = json!({"key": "value"});
+        let text = unsupported_content_block_text(&item);
+        assert!(text.contains("[Unsupported Claude content block: object]"));
+    }
+    #[test]
+    fn test_unsupported_content_block_text_null() {
+        let text = unsupported_content_block_text(&json!(null));
+        assert!(text.contains("[Unsupported Claude content block: null]"));
+    }
+    #[test]
+    fn test_unsupported_content_block_text_bool() {
+        let text = unsupported_content_block_text(&json!(true));
+        assert!(text.contains("[Unsupported Claude content block: boolean]"));
+    }
+    #[test]
+    fn test_unsupported_content_block_text_number() {
+        let text = unsupported_content_block_text(&json!(42));
+        assert!(text.contains("[Unsupported Claude content block: number]"));
+    }
+
+    // ========================================================================
+    // parse_claude_content_blocks — non-array and malformed paths
+    // ========================================================================
+    #[test]
+    fn test_parse_claude_content_blocks_non_array_value() {
+        let blocks = parse_claude_content_blocks(&json!("just a string"), "user");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ClaudeContentBlock::Text { text, .. } => assert!(text.contains("Unsupported Claude content block: text")),
+            _ => panic!("expected text block"),
+        }
+    }
+    #[test]
+    fn test_parse_claude_content_blocks_number() {
+        let blocks = parse_claude_content_blocks(&json!(42), "user");
+        assert_eq!(blocks.len(), 1);
+    }
+    #[test]
+    fn test_parse_claude_content_blocks_array_with_strings() {
+        let blocks = parse_claude_content_blocks(&json!(["hello", "world"]), "user");
+        assert_eq!(blocks.len(), 2);
+    }
+    #[test]
+    fn test_parse_claude_content_blocks_array_with_malformed_block() {
+        let blocks = parse_claude_content_blocks(
+            &json!([{"type": "unknown_type", "data": "test"}]),
+            "assistant",
+        );
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ClaudeContentBlock::Text { text, .. } => {
+                assert!(text.contains("Unsupported Claude content block: unknown_type"));
+            }
+            _ => panic!("expected text fallback block"),
+        }
+    }
+
+    // ========================================================================
+    // normalize_reasoning_effort
+    // ========================================================================
+    #[test]
+    fn test_normalize_reasoning_effort_none() {
+        assert_eq!(normalize_reasoning_effort(None), None);
+    }
+    #[test]
+    fn test_normalize_reasoning_effort_empty() {
+        assert_eq!(normalize_reasoning_effort(Some("")), None);
+    }
+    #[test]
+    fn test_normalize_reasoning_effort_whitespace() {
+        assert_eq!(normalize_reasoning_effort(Some("   ")), None);
+    }
+    #[test]
+    fn test_normalize_reasoning_effort_uppercase() {
+        assert_eq!(normalize_reasoning_effort(Some("HIGH")), Some("high".into()));
+    }
+    #[test]
+    fn test_normalize_reasoning_effort_with_spaces() {
+        assert_eq!(normalize_reasoning_effort(Some("  medium  ")), Some("medium".into()));
+    }
+
+    // ========================================================================
+    // default_document_filename — various media types
+    // ========================================================================
+    #[test]
+    fn test_default_document_filename_pdf() {
+        assert_eq!(default_document_filename("application/pdf"), "document.pdf");
+    }
+    #[test]
+    fn test_default_document_filename_text() {
+        assert_eq!(default_document_filename("text/plain"), "document.txt");
+    }
+    #[test]
+    fn test_default_document_filename_markdown() {
+        assert_eq!(default_document_filename("text/markdown"), "document.md");
+    }
+    #[test]
+    fn test_default_document_filename_json() {
+        assert_eq!(default_document_filename("application/json"), "document.json");
+    }
+    #[test]
+    fn test_default_document_filename_custom() {
+        assert_eq!(default_document_filename("image/png"), "document.png");
+    }
+    #[test]
+    fn test_default_document_filename_unknown_with_slash() {
+        // "application/x-custom" → rsplit('/') gives "x-custom" → filter alphanumeric gives "xcustom"
+        assert_eq!(default_document_filename("application/x-custom"), "document.xcustom");
+    }
+    #[test]
+    fn test_default_document_filename_no_slash() {
+        // "unknown" has no slash → falls back to "bin" extension
+        assert_eq!(default_document_filename("unknown"), "document.bin");
+    }
+    #[test]
+    fn test_default_document_filename_empty() {
+        assert_eq!(default_document_filename(""), "document.bin");
+    }
+
+    // ========================================================================
+    // Validation error paths through messages()
+    // ========================================================================
+    #[tokio::test]
+    async fn test_messages_too_many_messages_returns_error() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let msgs: Vec<Value> = (0..100_001)
+            .map(|_| json!({"role": "user", "content": "x"}))
+            .collect();
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": msgs,
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_content_too_large_returns_error() {
+        let app = test_app(spawn_mock_backend().await, false);
+        // Use an image block with huge base64 data so serialized size > 5MB
+        // but extract_text_from_content returns minimal text (avoids tiktoken stack overflow).
+        let big_data = "x".repeat(5 * 1024 * 1024 + 100);
+        let content = json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": big_data}}]);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(parsed["error"]["type"], "request_too_large");
+    }
+
+    #[tokio::test]
+    async fn test_messages_invalid_max_tokens_zero_returns_error() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_invalid_max_tokens_too_large_returns_error() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100_001,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_system_prompt_too_large_returns_error() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let big_system = "x".repeat(100 * 1024 + 1);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": big_system,
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_anthropic_oauth_token_rejected() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"));
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), headers, axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(parsed["error"]["type"], "authentication_error");
+        assert!(parsed["error"]["message"].as_str().unwrap().contains("Anthropic OAuth"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_anthropic_oauth_token_rejected() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"));
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let error = messages(State(app), headers, axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_empty_messages_returns_error_tuple() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_too_many_messages_returns_error_tuple() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let msgs: Vec<Value> = (0..100_001)
+            .map(|_| json!({"role": "user", "content": "x"}))
+            .collect();
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": msgs,
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_content_too_large_returns_error_tuple() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let big_data = "x".repeat(5 * 1024 * 1024 + 100);
+        let content = json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": big_data}}]);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_invalid_max_tokens_returns_error_tuple() {
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0,
+            "stream": true
+        }));
+        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_messages_system_prompt_with_cache_control() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": [{"type": "text", "text": "be helpful", "cache_control": {"type": "ephemeral"}}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, _) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let captured = captured.read().await;
+        assert!(!captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_messages_with_service_tier_accepted() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "priority",
+            "max_tokens": 32,
+            "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        assert!(!captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_non_retryable_non_streaming_error() {
+        let backend_url = spawn_static_backend(
+            StatusCode::FORBIDDEN,
+            "application/json",
+            json!({"error": {"message": "forbidden"}}).to_string(),
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(parsed["error"]["type"], "permission_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_backend_500_retryable_stream() {
+        let backend_url = spawn_static_backend(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            json!({"error": {"message": "internal"}}).to_string(),
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_backend_502_retryable_stream() {
+        let backend_url = spawn_static_backend(
+            StatusCode::BAD_GATEWAY,
+            "application/json",
+            json!({"error": {"message": "bad gateway"}}).to_string(),
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_backend_504_retryable_stream() {
+        let backend_url = spawn_static_backend(
+            StatusCode::GATEWAY_TIMEOUT,
+            "application/json",
+            json!({"error": {"message": "timeout"}}).to_string(),
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_404_with_empty_models_list() {
+        // When 404 but models list is empty, should fall through to generic error
+        let backend_url = spawn_static_backend(
+            StatusCode::NOT_FOUND,
+            "application/json",
+            json!({"error": {"message": "not found"}}).to_string(),
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "missing-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(parsed["error"]["type"], "not_found_error");
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_404_with_empty_models_list() {
+        // When 404 but models list is empty, falls through to generic error stream
+        let backend_url = spawn_static_backend(
+            StatusCode::NOT_FOUND,
+            "application/json",
+            json!({"error": {"message": "not found"}}).to_string(),
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "missing-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_unexpected_content_type_warning() {
+        // Backend returns text/html — should log warning but still process
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "text/html",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        // Should still produce SSE output despite unexpected content type
+        assert!(body.contains("event: message_start") || body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_with_image_content_block() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+                ]
+            }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let content = captured[0]["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,iVBOR"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_with_document_missing_media_type() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "base64"}}
+                ]
+            }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let content = captured[0]["messages"][0]["content"].as_str().unwrap();
+        // Should degrade to text placeholder for missing media_type/data
+        assert!(content.contains("Unsupported document"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_with_document_file_missing_file_id() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "file"}}
+                ]
+            }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let content = captured[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(content.contains("missing file_id"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_with_document_unknown_source_type() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "s3", "url": "s3://bucket/key"}}
+                ]
+            }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let content = captured[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(content.contains("source_type=s3"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_removes_empty_assistant_placeholder() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": ""}
+            ],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let msgs = captured[0]["messages"].as_array().unwrap();
+        // The empty assistant placeholder should have been removed
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn test_messages_with_system_prompt_string() {
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": "You are a helpful assistant",
+            "max_tokens": 32,
+            "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let msgs = captured[0]["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are a helpful assistant");
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_empty_response_content() {
+        // Backend returns a response with no content — should get empty text block
+        let body = json!({
+            "id": "chatcmpl-empty",
+            "object": "chat.completion",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0}
+        }).to_string();
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "application/json",
+            body,
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (_, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        // Should have at least one content block (empty text)
+        assert!(parsed["content"].is_array());
+        assert!(parsed["content"].as_array().unwrap().len() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_messages_default_stream_is_true() {
+        // When stream field is omitted, it defaults to true (streaming)
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        // Streaming response should contain SSE events
+        assert!(body.contains("event: message_start"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_with_reasoning_model() {
+        // Test streaming with a reasoning model to cover reasoning delta path
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "deepseek-r1",
+            "messages": [{"role": "user", "content": "think about this"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_with_tools() {
+        // Test streaming with tools to cover tool call delta path
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "read a file"}],
+            "tools": [{
+                "name": "read_file",
+                "description": "Read file",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("event: message_stop"));
+    }
+
 }

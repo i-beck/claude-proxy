@@ -154,4 +154,69 @@ mod tests {
         assert!(!breaker.is_open);
         assert_eq!(breaker.consecutive_failures, 0);
     }
+
+    #[test]
+    fn test_circuit_breaker_allows_request_when_enabled_but_closed() {
+        // Line 69: enabled && !is_open → return true
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = false;
+
+        assert!(breaker.should_allow_request());
+    }
+
+    #[test]
+    fn test_circuit_breaker_blocks_when_open_and_no_failure_time() {
+        // Line 80: enabled, open, but last_failure_time is None → false
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = true;
+        breaker.last_failure_time = None;
+
+        assert!(!breaker.should_allow_request());
+    }
+
+    #[test]
+    fn test_circuit_breaker_blocks_when_open_and_timeout_not_elapsed() {
+        // Line 80: enabled, open, recent failure time → false
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        breaker.last_failure_time = Some(SystemTime::now() - Duration::from_secs(10));
+
+        assert!(!breaker.should_allow_request());
+    }
+
+    #[test]
+    fn test_circuit_breaker_record_failure_increments_and_sets_time() {
+        let mut breaker = CircuitBreakerState::new(true);
+        assert!(breaker.last_failure_time.is_none());
+
+        breaker.record_failure();
+
+        assert_eq!(breaker.consecutive_failures, 1);
+        assert!(breaker.last_failure_time.is_some());
+        assert!(!breaker.is_open); // only 1 failure, below threshold
+    }
+
+    #[test]
+    fn test_circuit_breaker_record_failure_below_threshold_does_not_open() {
+        let mut breaker = CircuitBreakerState::new(true);
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD - 1 {
+            breaker.record_failure();
+        }
+
+        assert!(!breaker.is_open);
+        assert_eq!(
+            breaker.consecutive_failures,
+            CIRCUIT_BREAKER_FAILURE_THRESHOLD - 1
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_new_disabled() {
+        let breaker = CircuitBreakerState::new(false);
+        assert!(!breaker.enabled);
+        assert!(!breaker.is_open);
+        assert_eq!(breaker.consecutive_failures, 0);
+        assert!(breaker.last_failure_time.is_none());
+    }
 }

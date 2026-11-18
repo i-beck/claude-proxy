@@ -114,4 +114,60 @@ mod tests {
     fn test_get_price_tier_premium() {
         assert_eq!(get_price_tier(Some(20.0), Some(30.0)), "💎");
     }
+
+    #[test]
+    fn test_get_price_tier_only_input_price() {
+        // (Some(p), None) arm — uses the single price as average
+        assert_eq!(get_price_tier(Some(0.5), None), "💰");
+        assert_eq!(get_price_tier(Some(3.0), None), "💵");
+    }
+
+    #[test]
+    fn test_get_price_tier_only_output_price() {
+        // (None, Some(p)) arm — uses the single price as average
+        assert_eq!(get_price_tier(None, Some(0.3)), "💰");
+        assert_eq!(get_price_tier(None, Some(10.0)), "💸");
+    }
+
+    #[test]
+    fn test_get_price_tier_boundary_between_cheap_and_affordable() {
+        // avg exactly 1.0 → affordable (1.0 < 1.0 is false, falls to next)
+        assert_eq!(get_price_tier(Some(1.0), Some(1.0)), "💵");
+    }
+
+    #[test]
+    fn test_get_price_tier_boundary_affordable_moderate() {
+        // avg exactly 5.0 → moderate
+        assert_eq!(get_price_tier(Some(5.0), Some(5.0)), "💸");
+    }
+
+    #[test]
+    fn test_get_price_tier_boundary_moderate_premium() {
+        // avg exactly 15.0 → premium
+        assert_eq!(get_price_tier(Some(15.0), Some(15.0)), "💎");
+    }
+
+    #[test]
+    fn test_get_price_tier_boundary_between_affordable_and_moderate() {
+        // avg exactly 5.0 → moderate
+        assert_eq!(get_price_tier(Some(5.0), Some(5.0)), "💸");
+    }
+
+    #[test]
+    fn test_get_price_tier_boundary_between_moderate_and_premium() {
+        // avg exactly 15.0 → premium
+        assert_eq!(get_price_tier(Some(15.0), Some(15.0)), "💎");
+    }
+
+    #[test]
+    fn test_get_price_tier_input_only() {
+        // One-sided pricing: only input price present
+        assert_eq!(get_price_tier(Some(0.3), None), "💰");
+    }
+
+    #[test]
+    fn test_get_price_tier_output_only() {
+        // One-sided pricing: only output price present
+        assert_eq!(get_price_tier(None, Some(3.0)), "💵");
+    }
 }

@@ -662,4 +662,201 @@ mod tests {
     fn test_translate_finish_reason_empty_string() {
         assert_eq!(translate_finish_reason(Some("")), "end_turn");
     }
+
+    // ============================================================================
+    // count_input_tokens tests (system prompt + tools branches)
+    // ============================================================================
+
+    #[test]
+    fn test_count_input_tokens_includes_non_empty_string_system() {
+        let messages = vec![crate::models::ClaudeMessage {
+            role: "user".into(),
+            content: json!("hi"),
+        }];
+        let count_with_system = count_input_tokens(&messages, &Some(json!("You are helpful")), &None);
+        let count_without = count_input_tokens(&messages, &None, &None);
+        assert!(count_with_system > count_without);
+    }
+
+    #[test]
+    fn test_count_input_tokens_includes_non_string_system() {
+        let messages = vec![crate::models::ClaudeMessage {
+            role: "user".into(),
+            content: json!("hi"),
+        }];
+        // System as an array of blocks (non-string Value) exercises the to_string branch.
+        let count = count_input_tokens(
+            &messages,
+            &Some(json!([{"type": "text", "text": "system rule"}])),
+            &None,
+        );
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_input_tokens_includes_tools() {
+        let messages = vec![crate::models::ClaudeMessage {
+            role: "user".into(),
+            content: json!("hi"),
+        }];
+        let tools = vec![crate::models::ClaudeTool {
+            name: "calculator".into(),
+            description: Some("A calculator".into()),
+            input_schema: json!({"type": "object", "properties": {"expr": {"type": "string"}}}),
+        }];
+        let count_with_tools = count_input_tokens(&messages, &None, &Some(tools));
+        let count_without = count_input_tokens(&messages, &None, &None);
+        assert!(count_with_tools > count_without);
+    }
+
+    // ============================================================================
+    // extract_text_from_content — additional branches
+    // ============================================================================
+
+    #[test]
+    fn test_extract_text_tool_result_array_with_non_text_objects() {
+        // tool_result content array with a non-text object block (uses to_string fallback)
+        let content = json!([
+            {
+                "type": "tool_result",
+                "content": [
+                    {"type": "image", "source": {"data": "..."}},
+                    {"type": "text", "text": "visible"}
+                ]
+            }
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert!(text.contains("visible"));
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_tool_result_array_with_string_items() {
+        let content = json!([
+            {
+                "type": "tool_result",
+                "content": ["plain string in array", "another"]
+            }
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert!(text.contains("plain string in array"));
+        assert!(text.contains("another"));
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_array_with_bare_string_items() {
+        // Array containing plain strings (not objects) — exercises block.as_str() branch
+        let content = json!(["just a string", "second string"]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "just a string\nsecond string");
+        assert_eq!(images, 0);
+    }
+
+    // ============================================================================
+    // serialize_tool_result_content — additional branches
+    // ============================================================================
+
+    #[test]
+    fn test_serialize_tool_result_array_with_non_text_object() {
+        let content = json!([
+            {"type": "image", "source": {"data": "..."}}
+        ]);
+        let result = serialize_tool_result_content(&content);
+        // Non-text object is JSON-serialized via to_string fallback
+        assert!(result.contains("image"));
+    }
+
+    #[test]
+    fn test_serialize_tool_result_array_with_number() {
+        let content = json!([42, "text"]);
+        let result = serialize_tool_result_content(&content);
+        assert!(result.contains("42"));
+        assert!(result.contains("text"));
+    }
+
+    // ============================================================================
+    // convert_tool_choice — additional branches
+    // ============================================================================
+
+    #[test]
+    fn test_convert_tool_choice_string_none() {
+        let (result, parallel) = convert_tool_choice(Some(json!("none")));
+        assert_eq!(result, Some(json!("none")));
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn test_convert_tool_choice_string_required() {
+        let (result, parallel) = convert_tool_choice(Some(json!("required")));
+        assert_eq!(result, Some(json!("required")));
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn test_convert_tool_choice_string_unknown() {
+        let (result, parallel) = convert_tool_choice(Some(json!("weird")));
+        assert_eq!(result, Some(json!("weird")));
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_missing_type() {
+        let (result, parallel) = convert_tool_choice(Some(json!({"disable_parallel_tool_use": true})));
+        assert_eq!(result, Some(json!({"disable_parallel_tool_use": true})));
+        assert_eq!(parallel, Some(false));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_tool_with_tool_name_alias() {
+        let (result, _parallel) = convert_tool_choice(Some(json!({
+            "type": "tool",
+            "tool_name": "my_tool"
+        })));
+        assert_eq!(
+            result,
+            Some(json!({"type": "function", "function": {"name": "my_tool"}}))
+        );
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_function() {
+        let (result, parallel) = convert_tool_choice(Some(json!({
+            "type": "function",
+            "function": {"name": "foo"}
+        })));
+        assert_eq!(result, Some(json!({"type": "function", "function": {"name": "foo"}})));
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_none() {
+        let (result, _parallel) = convert_tool_choice(Some(json!({"type": "none"})));
+        assert_eq!(result, Some(json!("none")));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_any() {
+        let (result, _parallel) = convert_tool_choice(Some(json!({"type": "any"})));
+        assert_eq!(result, Some(json!("required")));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_required() {
+        let (result, _parallel) = convert_tool_choice(Some(json!({"type": "required"})));
+        assert_eq!(result, Some(json!("required")));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_unknown_type() {
+        let (result, _parallel) = convert_tool_choice(Some(json!({"type": "weird"})));
+        assert_eq!(result, Some(json!({"type": "weird"})));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_non_string_non_object() {
+        let (result, parallel) = convert_tool_choice(Some(json!(42)));
+        assert_eq!(result, Some(json!(42)));
+        assert_eq!(parallel, None);
+    }
 }
