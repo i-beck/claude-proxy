@@ -1,7 +1,5 @@
 use crate::constants::*;
-use crate::models::{
-    App, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage, OAIStreamChunk,
-};
+use crate::models::{App, CircuitBreakerState, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage, OAIStreamChunk};
 use crate::services::{
     build_model_list_content, extract_client_key, format_backend_error, get_available_models,
     mask_token, SseEventParser, ToolBuf, ToolsMap,
@@ -24,6 +22,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     convert::Infallible,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -6319,6 +6318,116 @@ mod tests {
         let _ = response_text(r).await;
         let captured = captured.read().await;
         assert_eq!(captured[0]["stop"].as_array().unwrap().len(), 2);
+    }
+
+    // ========================================================================
+    // spawn_capturing_backend streaming branch: the capturing backend's SSE
+    // response path (the `if payload["stream"]` → SSE-body branch) was never
+    // exercised because every test using it sent `stream: false`. This drives
+    // `stream: true` so the helper's SSE-body construction executes, and asserts
+    // the proxy translates the captured SSE into a valid Claude stream.
+    // ========================================================================
+    #[tokio::test]
+    async fn test_capturing_backend_streaming_branch_produces_claude_sse() {
+        crate::test_log::init_test_logger();
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "stream me"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+        // The proxy emits a Claude Messages SSE stream.
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: message_stop"));
+        assert!(body.contains("captured"));
+        // The capturing backend received stream:true in the forwarded payload.
+        let captured = captured.read().await;
+        assert_eq!(captured[0]["stream"].as_bool(), Some(true));
+    }
+
+    // ========================================================================
+    // Drain trailing bytes after [DONE] (line 2030): a backend that sends the
+    // [DONE] marker in one chunk then MORE bytes in a later chunk exercises
+    // the drain loop's `Ok(chunk)` arm (`drained_bytes += chunk.len()`).
+    // Uses a streaming body that yields [DONE] then trailing data separately.
+    // ========================================================================
+    #[tokio::test]
+    async fn test_streaming_drains_trailing_bytes_after_done() {
+        crate::test_log::init_test_logger();
+        use futures::stream;
+        use axum::body::Body;
+
+        let models_body = json!({ "data": [] });
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get({
+                    let models_body = models_body.clone();
+                    move || {
+                        let models_body = models_body.clone();
+                        async move { (StatusCode::OK, Json(models_body)).into_response() }
+                    }
+                }),
+            )
+            .route("/v1/chat/completions", post(|| async move {
+                let first = json!({
+                    "id": "chatcmpl-drain",
+                    "object": "chat.completion.chunk",
+                    "model": "zai-org/GLM-4.5-Air",
+                    "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+                });
+                let second = json!({
+                    "id": "chatcmpl-drain",
+                    "object": "chat.completion.chunk",
+                    "model": "zai-org/GLM-4.5-Air",
+                    "choices": [{ "index": 0, "delta": { "content": "drained" }, "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3 }
+                });
+                // Two chunks: the SSE body (ending in [DONE]\n\n), then a
+                // separate trailing-bytes chunk that arrives later. The drain
+                // loop reads the second chunk via bytes_stream.next().
+                let chunk1 = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+                let chunk2 = "trailing-garbage-after-done".to_string();
+                let body = Body::from_stream(stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(chunk1.into_bytes()),
+                    Ok(chunk2.into_bytes()),
+                ]));
+                let mut resp = Response::new(body);
+                resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                resp
+            }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend_url = format!("http://{addr}/v1/chat/completions");
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("event: message_stop"));
+        assert!(body.contains("drained"));
     }
 
 }
