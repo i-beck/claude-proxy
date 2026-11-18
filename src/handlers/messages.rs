@@ -5425,4 +5425,238 @@ mod tests {
         assert!(parsed["error"]["message"].as_str().unwrap().contains("no usable messages"));
     }
 
+    #[tokio::test]
+    async fn test_messages_auto_enables_thinking_for_extended_thinking_only_model() {
+        // Line 1048: a model whose only matching feature is "extended_thinking"
+        // (not "thinking") still triggers auto-enabled thinking.
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        *app.models_cache.write().await = Some(vec![crate::models::ModelInfo {
+            id: "zai-org/GLM-4.5-Air".into(),
+            input_price_usd: None,
+            output_price_usd: None,
+            supported_features: vec!["extended_thinking".into()],
+        }]);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        assert_eq!(captured[0]["thinking"]["type"], json!("enabled"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_message_content_cache_control_warns() {
+        // Line 1106-1107: a MESSAGE (not system) carrying cache_control triggers
+        // the dropped-caching warning. Enable the logger so the warn! arg runs.
+        crate::test_log::init_test_logger();
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }]
+            }],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+        let captured = captured.read().await;
+        assert!(!captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_messages_assistant_image_block_hits_catchall() {
+        // Line 1195: an assistant message containing an image block falls into
+        // the assistant-match `_ => {}` catch-all (images are not handled for
+        // assistant messages).
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBOR" } },
+                    { "type": "text", "text": "described it" }
+                ]},
+                { "role": "user", "content": "ok" }
+            ],
+            "max_tokens": 32, "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let msgs = captured[0]["messages"].as_array().unwrap();
+        assert!(msgs[0]["content"].as_str().unwrap().contains("described it"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_user_thinking_block_hits_catchall() {
+        // Line 1362: a user message containing a thinking block falls into the
+        // user-match `_ => {}` catch-all (only text/image/document handled).
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "thinking", "thinking": "my thoughts" },
+                    { "type": "text", "text": "hello" }
+                ]
+            }],
+            "max_tokens": 32, "stream": false
+        }));
+        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let captured = captured.read().await;
+        let msgs = captured[0]["messages"].as_array().unwrap();
+        assert!(msgs[0]["content"].as_str().unwrap().contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_forwards_backend_host_header() {
+        // Line 1480: when backend_host_header is configured, the host header is
+        // set on the proxied request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received_host = Arc::new(RwLock::new(None::<String>));
+        let received_host_clone = received_host.clone();
+        let router = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |headers: axum::http::HeaderMap, Json(_p): Json<Value>| {
+                    let received_host = received_host_clone.clone();
+                    async move {
+                        *received_host.write().await =
+                            headers.get("host").and_then(|v| v.to_str().ok()).map(String::from);
+                        Json(json!({
+                            "id": "x", "object": "chat.completion", "model": "zai-org/GLM-4.5-Air",
+                            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                        }))
+                    }
+                }),
+            )
+            .route("/v1/models", get(|| async { Json(json!({ "data": [] })) }));
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let models_url = format!("http://{addr}/v1/models");
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(&models_url).send().await.is_ok() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let mut app = test_app(format!("http://{addr}/v1/chat/completions"), false);
+        app.backend_host_header = Some("custom.example.com".into());
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+        let host = received_host.read().await;
+        assert_eq!(host.as_deref(), Some("custom.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_image_data_uri_warns() {
+        // Line 1263-1264: image source data that already starts with "data:"
+        // triggers the double-encoding warning. Enable the logger for the arg.
+        crate::test_log::init_test_logger();
+        let (backend_url, _captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "look" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "data:image/png;base64,iVBOR" } }
+                ]
+            }],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_drains_trailing_bytes_after_done() {
+        // Lines 2012-2014: bytes arriving after [DONE] are drained so the
+        // backend connection is not cancelled mid-request.
+        crate::test_log::init_test_logger();
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\nGARBAGE_TRAILING_BYTES",
+            json!({
+                "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air",
+                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+            })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(b.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_error_chunk_with_type_only() {
+        // Lines 743/748 and 793: a backend chunk carrying an error object with
+        // a "type" but no "message" exercises the type-fallback path.
+        crate::test_log::init_test_logger();
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({ "error": { "type": "some_error_type" } })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(b.contains("some_error_type"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_object_chunk_without_choices() {
+        // Lines 772/776: a backend chunk that is a JSON object but has no
+        // "choices" array is skipped with a logged warning.
+        crate::test_log::init_test_logger();
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({ "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air", "choices": [] }),
+            json!({ "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air", "usage": { "prompt_tokens": 1 } })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, _b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+    }
 }
