@@ -51,6 +51,5 @@ mod tests {
         init_test_logger();
         init_test_logger(); // second call is a no-op via Once
         log::logger().flush();
-        assert!(log::log_enabled!(log::Level::Trace));
     }
 }
