@@ -291,15 +291,6 @@ mod tests {
             "http://localhost:8000/v1/models"
         );
     }
-    fn make_app_with_host_header(backend_url: String, host_header: Option<String>) -> App {
-        App {
-            client: reqwest::Client::new(),
-            backend_url,
-            backend_host_header: host_header,
-            models_cache: Arc::new(RwLock::new(None)),
-            circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState::new(false))),
-        }
-    }
 
     #[tokio::test]
     async fn test_refresh_models_cache_no_price_no_pricing() {

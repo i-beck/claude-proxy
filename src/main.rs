@@ -87,6 +87,7 @@ fn build_router(app: App) -> Router {
 // are individually tested in the test module below. The graceful shutdown
 // and background cache refresh task are integration concerns tested via
 // the shell-based API spec tests (test.sh --all).
+#[cfg(not(test))]
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
@@ -313,5 +314,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_runtime_config_from_env_returns_defaults() {
+        // Ensure no proxy-specific env vars are set so defaults are used.
+        std::env::remove_var("BACKEND_URL");
+        std::env::remove_var("BACKEND_HOST_HEADER");
+        std::env::remove_var("BACKEND_TIMEOUT_SECS");
+        std::env::remove_var("ENABLE_CIRCUIT_BREAKER");
+        std::env::remove_var("HOST_PORT");
+
+        let config = RuntimeConfig::from_env();
+        assert_eq!(
+            config.backend_url,
+            "http://127.0.0.1:8000/v1/chat/completions"
+        );
+        assert_eq!(config.backend_timeout_secs, 600);
+        assert!(!config.circuit_breaker_enabled);
+        assert_eq!(config.host_port, 8080);
     }
 }
