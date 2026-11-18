@@ -12,6 +12,8 @@ pub async fn count_tokens(
         count_input_tokens(&req.messages, &req.system, &req.tools)
     })
     .await
+    // coverage: unreachable — count_input_tokens never panics, so spawn_blocking's
+    // JoinError (panic propagation) cannot occur in practice
     .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "tokenization_failed"))?;
 
     Ok(axum::Json(json!({ "input_tokens": token_count })))

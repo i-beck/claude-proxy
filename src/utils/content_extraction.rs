@@ -49,6 +49,8 @@ pub fn count_input_tokens(
             let image_tokens = image_count * TOKENS_PER_IMAGE;
             (text_tokens + image_tokens) as u32
         }
+        // coverage: unreachable — tiktoken_rs::cl100k_base() always returns Ok in practice;
+        // the Err branch is a defensive fallback that never triggers
         Err(_) => {
             let text_estimate = std::cmp::max(1, combined_text.len() / CHARS_PER_TOKEN);
             let image_tokens = image_count * TOKENS_PER_IMAGE;
