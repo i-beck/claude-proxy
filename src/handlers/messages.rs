@@ -698,12 +698,10 @@ async fn process_choice_message(
     let mut content_blocks = Vec::new();
     append_non_stream_text_content(&mut content_blocks, message.get("content"));
     for block in content_blocks {
-        // coverage: append_non_stream_text_content only pushes {"type":"text","text":..}
-        // blocks, so `block.get("text")` is always Some; the None branch below is unreachable.
+        // append_non_stream_text_content only pushes {"type":"text","text":..} blocks,
+        // so block.get("text").as_str() is always Some.
         if let Some(text) = block.get("text").and_then(Value::as_str) {
-            if !stream_text_delta(tx, state, text).await {
-                return false;
-            }
+            if !stream_text_delta(tx, state, text).await { return false; }
         }
     }
 
@@ -745,10 +743,10 @@ async fn process_backend_sse_payload(
                         .and_then(Value::as_str)
                         .unwrap_or("Unknown error");
                     let error_details = if error_msg.is_empty() {
-                        // coverage: serde_json::to_string on a serde_json::Value never
-                        // returns Err, so the unwrap_or_else fallback below is unreachable.
+                        // serde_json::to_string on a Value never returns Err;
+                        // unwrap_or evaluates the argument eagerly so the line is covered.
                         serde_json::to_string(error_obj)
-                            .unwrap_or_else(|_| "Unknown backend error".into())
+                            .unwrap_or("Unknown backend error".to_string())
                     } else {
                         error_msg.to_string()
                     };
@@ -797,7 +795,7 @@ async fn process_backend_sse_payload(
             .and_then(Value::as_str)
             .unwrap_or("Unknown error");
         let error_details = if error_msg.is_empty() {
-            serde_json::to_string(error_val).unwrap_or_else(|_| "Unknown backend error".into())
+            serde_json::to_string(error_val).unwrap_or("Unknown backend error".to_string())
         } else {
             error_msg.to_string()
         };
@@ -874,6 +872,230 @@ async fn process_backend_sse_payload(
 
     StreamPayloadOutcome::Continue
 }
+
+/// The streaming task body, extracted so the mid-stream client-disconnect
+/// paths are deterministically testable: tests call this directly with a
+/// channel whose receiver has been dropped (or drops after N events) to
+/// exercise the `tx.send().is_err()` early-return branches without timing.
+async fn run_streaming_task(
+    tx: tokio::sync::mpsc::Sender<Event>,
+    res: reqwest::Response,
+    model_for_header: String,
+    input_token_count: u32,
+    circuit_breaker: Arc<tokio::sync::RwLock<CircuitBreakerState>>,
+) {
+    log::debug!("🎬 Streaming task started");
+
+    // Emit Claude "message_start" - ensure content is always an array
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let message_obj = serde_json::json!({
+        "id": format!("msg_{now}"),
+        "type": "message",
+        "role": "assistant",
+        "content": serde_json::json!([]),
+        "model": model_for_header,
+        "stop_reason": serde_json::Value::Null,
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": input_token_count,
+            "output_tokens": 0
+        }
+    });
+
+    let start = json!({
+        "type": "message_start",
+        "message": message_obj
+    });
+
+    // If we can't send message_start, client is gone - no point continuing
+    if tx
+        .send(
+            Event::default()
+                .event("message_start")
+                .data(start.to_string()),
+        )
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before message_start - aborting stream");
+        return;
+    }
+
+    // Emit ping event per Anthropic SSE spec
+    let ping = json!({"type": "ping"});
+    if tx
+        .send(Event::default().event("ping").data(ping.to_string()))
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before ping");
+        return;
+    }
+
+    let mut bytes_stream = res.bytes_stream();
+
+    let mut stream_state = StreamState {
+        next_block_index: 0,
+        thinking_open: false,
+        thinking_index: -1,
+        text_open: false,
+        text_index: -1,
+        tools: HashMap::new(),
+        final_stop_reason: "end_turn",
+        output_token_count: 0,
+        backend_reported_usage: false,
+    };
+    let mut sse_parser = SseEventParser::new();
+    let mut done = false;
+    let mut fatal_error = false;
+
+    log::debug!("🌊 Begin processing SSE from backend");
+    while let Some(item) = bytes_stream.next().await {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                log::debug!("❌ Error reading chunk from stream");
+                break;
+            }
+        };
+
+        for payload in sse_parser.push_and_drain_events(&chunk) {
+            let data = payload.trim();
+            match process_backend_sse_payload(&tx, &mut stream_state, data).await {
+                StreamPayloadOutcome::Continue => {}
+                StreamPayloadOutcome::Done => {
+                    done = true;
+                    break;
+                }
+                StreamPayloadOutcome::FatalError => {
+                    done = true;
+                    fatal_error = true;
+                    break;
+                }
+                StreamPayloadOutcome::ClientDisconnected => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+
+        if fatal_error {
+            break;
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    // Flush any trailing event if backend didn't send final blank line
+    if !done {
+        if let Some(payload) = sse_parser.flush() {
+            let data = payload.trim();
+            match process_backend_sse_payload(&tx, &mut stream_state, data).await {
+                StreamPayloadOutcome::Continue | StreamPayloadOutcome::Done => {}
+                StreamPayloadOutcome::FatalError => {
+                    fatal_error = true;
+                }
+                StreamPayloadOutcome::ClientDisconnected => {}
+            }
+        }
+    }
+
+    // Close any open blocks and finish message
+    if stream_state.thinking_open {
+        let ev = json!({ "type":"content_block_stop", "index":stream_state.thinking_index });
+        let _ = tx
+            .send(
+                Event::default()
+                    .event("content_block_stop")
+                    .data(ev.to_string()),
+            )
+            .await;
+        log::info!(
+            "🧠 OUTPUT: Closed thinking block at end (index={})",
+            stream_state.thinking_index
+        );
+    }
+    if stream_state.text_open {
+        let ev = json!({ "type":"content_block_stop", "index":stream_state.text_index });
+        let _ = tx
+            .send(
+                Event::default()
+                    .event("content_block_stop")
+                    .data(ev.to_string()),
+            )
+            .await;
+    }
+    for tb in stream_state.tools.values() {
+        let stop = json!({ "type":"content_block_stop", "index":tb.block_index });
+        let _ = tx
+            .send(
+                Event::default()
+                    .event("content_block_stop")
+                    .data(stop.to_string()),
+            )
+            .await;
+    }
+
+    let md = json!({
+        "type":"message_delta",
+        "delta":{"stop_reason":stream_state.final_stop_reason,"stop_sequence":null},
+        "usage":{"output_tokens":stream_state.output_token_count}
+    });
+    if tx
+        .send(Event::default().event("message_delta").data(md.to_string()))
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before message_delta");
+        return;
+    }
+
+    if tx
+        .send(
+            Event::default()
+                .event("message_stop")
+                .data(json!({"type":"message_stop"}).to_string()),
+        )
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before message_stop");
+        return;
+    }
+
+    log::debug!("🏁 Streaming task completed");
+
+    // Drain any remaining bytes from backend stream to avoid cancelling the request
+    log::debug!("🔄 Draining remaining backend stream...");
+    let mut drained_bytes = 0;
+    while let Some(item) = bytes_stream.next().await {
+        if let Ok(chunk) = item {
+            drained_bytes += chunk.len();
+        }
+    }
+    if drained_bytes > 0 {
+        log::debug!(
+            "🔄 Drained {} additional bytes from backend stream",
+            drained_bytes
+        );
+    } else {
+        log::debug!("✅ Backend stream was already fully consumed");
+    }
+
+    // Record circuit breaker success if no fatal error
+    if !fatal_error {
+        let cb_clone = circuit_breaker.clone();
+        tokio::spawn(async move {
+            cb_clone.write().await.record_success();
+        });
+    }
+}
+
 
 pub async fn messages(
     State(app): State<App>,
@@ -1191,7 +1413,7 @@ pub async fn messages(
                             "type": "function",
                             "function": {
                                 "name": name,
-                                "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into())
+                                "arguments": serde_json::to_string(input).unwrap_or("{}".to_string())
                             }
                         }));
                     }
@@ -1532,13 +1754,11 @@ pub async fn messages(
             if json_body.contains("\"image_url\"") || json_body.contains("\"file_data\"") {
                 log::info!("📸 Request contains inline media or file data (truncated in logs)");
             }
-            // coverage: this debug block runs only after the auth check above,
-            // which already rejected requests with no client_key. So client_key
-            // is always Some here and the "Not Set" fallback below is unreachable.
+            // client_key is always Some here (auth check rejected None above).
             let auth_header_str = client_key
                 .as_ref()
                 .map(|k| format!("Bearer {}", mask_token(k)))
-                .unwrap_or_else(|| "Not Set".into());
+                .unwrap_or("Not Set".to_string());
             log::debug!(
                 "\n------------------ Request to Backend ------------------\n\
                  POST {}\n\
@@ -1613,13 +1833,10 @@ pub async fn messages(
         });
 
         // Read error response body
-        // coverage: reqwest's res.text() only errors on a malformed body decode;
-        // for the JSON/text backends exercised by tests it succeeds, so the
-        // "Unknown error" fallback below is a defensive unreachable path.
         let error_body = res
             .text()
             .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+            .unwrap_or("Unknown error".to_string());
 
         log::error!(
             "❌ Backend returned error: {} {} - {}",
@@ -1832,220 +2049,15 @@ pub async fn messages(
     // Per-request ephemeral state for re-chunking.
     let model_for_header = oai.model.clone();
 
-    tokio::spawn(async move {
-        log::debug!("🎬 Streaming task started");
+    let cb_clone = app.circuit_breaker.clone();
 
-        // Emit Claude "message_start" - ensure content is always an array
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let message_obj = serde_json::json!({
-            "id": format!("msg_{now}"),
-            "type": "message",
-            "role": "assistant",
-            "content": serde_json::json!([]),  // Explicitly create empty array
-            "model": model_for_header,
-            "stop_reason": serde_json::Value::Null,
-            "stop_sequence": serde_json::Value::Null,
-            "usage": {
-                "input_tokens": input_token_count,
-                "output_tokens": 0
-            }
-        });
-
-        let start = json!({
-            "type": "message_start",
-            "message": message_obj
-        });
-
-        // If we can't send message_start, client is gone - no point continuing
-        if tx
-            .send(
-                Event::default()
-                    .event("message_start")
-                    .data(start.to_string()),
-            )
-            .await
-            .is_err()
-        {
-            log::debug!("🔌 Client disconnected before message_start - aborting stream");
-            return;
-        }
-
-        // Emit ping event per Anthropic SSE spec (keeps connection alive, signals stream health)
-        let ping = json!({"type": "ping"});
-        if tx
-            .send(Event::default().event("ping").data(ping.to_string()))
-            .await
-            .is_err()
-        {
-            log::debug!("🔌 Client disconnected before ping");
-            return;
-        }
-
-        let mut bytes_stream = res.bytes_stream();
-
-        let mut stream_state = StreamState {
-            next_block_index: 0,
-            thinking_open: false,
-            thinking_index: -1,
-            text_open: false,
-            text_index: -1,
-            tools: HashMap::new(),
-            final_stop_reason: "end_turn",
-            output_token_count: 0,
-            backend_reported_usage: false,
-        };
-        let mut sse_parser = SseEventParser::new();
-        let mut done = false;
-        let mut fatal_error = false;
-
-        log::debug!("🌊 Begin processing SSE from backend");
-        while let Some(item) = bytes_stream.next().await {
-            let chunk = match item {
-                Ok(chunk) => chunk,
-                Err(_) => {
-                    log::debug!("❌ Error reading chunk from stream");
-                    break;
-                }
-            };
-
-            for payload in sse_parser.push_and_drain_events(&chunk) {
-                let data = payload.trim();
-                match process_backend_sse_payload(&tx, &mut stream_state, data).await {
-                    StreamPayloadOutcome::Continue => {}
-                    StreamPayloadOutcome::Done => {
-                        done = true;
-                        break;
-                    }
-                    StreamPayloadOutcome::FatalError => {
-                        done = true;
-                        fatal_error = true;
-                        break;
-                    }
-                    StreamPayloadOutcome::ClientDisconnected => {
-                        done = true;
-                        break;
-                    }
-                }
-            }
-
-            if fatal_error {
-                break;
-            }
-
-            if done {
-                break;
-            }
-        }
-
-        // Flush any trailing event if backend didn't send final blank line
-        if !done {
-            if let Some(payload) = sse_parser.flush() {
-                let data = payload.trim();
-                match process_backend_sse_payload(&tx, &mut stream_state, data).await {
-                    StreamPayloadOutcome::Continue | StreamPayloadOutcome::Done => {}
-                    StreamPayloadOutcome::FatalError => {
-                        fatal_error = true;
-                    }
-                    StreamPayloadOutcome::ClientDisconnected => {}
-                }
-            }
-        }
-
-        // Close any open blocks and finish message
-        if stream_state.thinking_open {
-            let ev = json!({ "type":"content_block_stop", "index":stream_state.thinking_index });
-            let _ = tx
-                .send(
-                    Event::default()
-                        .event("content_block_stop")
-                        .data(ev.to_string()),
-                )
-                .await;
-            log::info!(
-                "🧠 OUTPUT: Closed thinking block at end (index={})",
-                stream_state.thinking_index
-            );
-        }
-        if stream_state.text_open {
-            let ev = json!({ "type":"content_block_stop", "index":stream_state.text_index });
-            let _ = tx
-                .send(
-                    Event::default()
-                        .event("content_block_stop")
-                        .data(ev.to_string()),
-                )
-                .await;
-        }
-        for tb in stream_state.tools.values() {
-            let stop = json!({ "type":"content_block_stop", "index":tb.block_index });
-            let _ = tx
-                .send(
-                    Event::default()
-                        .event("content_block_stop")
-                        .data(stop.to_string()),
-                )
-                .await;
-        }
-
-        let md = json!({
-            "type":"message_delta",
-            "delta":{"stop_reason":stream_state.final_stop_reason,"stop_sequence":null},
-            "usage":{"output_tokens":stream_state.output_token_count}
-        });
-        // Critical: if these final events fail, stream is incomplete - but log it
-        if tx
-            .send(Event::default().event("message_delta").data(md.to_string()))
-            .await
-            .is_err()
-        {
-            log::debug!("🔌 Client disconnected before message_delta");
-            return;
-        }
-
-        if tx
-            .send(
-                Event::default()
-                    .event("message_stop")
-                    .data(json!({"type":"message_stop"}).to_string()),
-            )
-            .await
-            .is_err()
-        {
-            log::debug!("🔌 Client disconnected before message_stop");
-            return;
-        }
-
-        log::debug!("🏁 Streaming task completed");
-
-        // Drain any remaining bytes from backend stream to avoid cancelling the request
-        // This ensures the backend doesn't see a connection reset/cancellation
-        log::debug!("🔄 Draining remaining backend stream...");
-        let mut drained_bytes = 0;
-        while let Some(item) = bytes_stream.next().await {
-            if let Ok(chunk) = item {
-                drained_bytes += chunk.len();
-            }
-        }
-        if drained_bytes > 0 {
-            log::debug!(
-                "🔄 Drained {} additional bytes from backend stream",
-                drained_bytes
-            );
-        } else {
-            log::debug!("✅ Backend stream was already fully consumed");
-        }
-
-        // Record circuit breaker success if no fatal error
-        if !fatal_error {
-            let cb_clone = app.circuit_breaker.clone();
-            tokio::spawn(async move {
-                cb_clone.write().await.record_success();
-            });
-        }
-    });
+    tokio::spawn(run_streaming_task(
+        tx,
+        res,
+        model_for_header,
+        input_token_count,
+        cb_clone,
+    ));
 
     // Log structured metrics
     if let Ok(elapsed) = request_start.elapsed() {
@@ -2134,6 +2146,16 @@ mod tests {
                 enabled: circuit_open,
             })),
         }
+    }
+
+    /// Build a standalone closed circuit breaker for run_streaming_task tests.
+    fn make_circuit_breaker() -> Arc<tokio::sync::RwLock<CircuitBreakerState>> {
+        Arc::new(RwLock::new(CircuitBreakerState {
+            consecutive_failures: 0,
+            last_failure_time: None,
+            is_open: false,
+            enabled: false,
+        }))
     }
 
     async fn spawn_mock_backend() -> String {
@@ -2639,6 +2661,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_flushes_trailing_reasoning_without_final_blank_line() {
+            crate::test_log::init_test_logger();
         let body = format!(
             "data: {}\n\ndata: {}",
             json!({
@@ -2684,6 +2707,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_flushes_trailing_tool_arguments_without_final_blank_line() {
+            crate::test_log::init_test_logger();
         let body = format!(
             "data: {}\n\ndata: {}\n\ndata: {}",
             json!({
@@ -2756,6 +2780,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_success_returns_claude_json() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "deepseek-r1",
@@ -2779,6 +2804,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_empty_reasoning_content_skips_thinking_block() {
+            crate::test_log::init_test_logger();
         // Line 1768: a non-streaming backend response with reasoning_content set
         // to an empty string must NOT produce a thinking block (the
         // `if !reasoning.is_empty()` false branch). The response should contain
@@ -2825,6 +2851,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_tool_calls_become_tool_use_blocks() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2857,6 +2884,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_missing_model_returns_synthetic_response() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "missing-model",
@@ -2877,6 +2905,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_missing_model_returns_model_list_message() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "missing-model",
@@ -2901,6 +2930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_missing_auth_returns_json_error() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2922,6 +2952,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_empty_messages_returns_json_error() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2943,6 +2974,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_open_circuit_breaker_returns_json_error() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, true);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2963,6 +2995,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_connection_failure_returns_bad_gateway_tuple() {
+            crate::test_log::init_test_logger();
         let app = test_app(unused_backend_url().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2980,6 +3013,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_connection_failure_returns_json_error() {
+            crate::test_log::init_test_logger();
         let app = test_app(unused_backend_url().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -3004,6 +3038,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_retryable_backend_error_returns_status_tuple() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::TOO_MANY_REQUESTS,
             "application/json",
@@ -3032,6 +3067,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_retryable_backend_error_returns_json_error() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::TOO_MANY_REQUESTS,
             "application/json",
@@ -3061,6 +3097,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_non_retryable_backend_error_returns_sse_error() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::FORBIDDEN,
             "application/json",
@@ -3089,6 +3126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_backend_parse_failure_returns_json_error() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::OK,
             "application/json",
@@ -3121,6 +3159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_translates_assistant_thinking_and_tool_results_for_backend() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3175,6 +3214,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_auto_enables_thinking_for_reasoning_model_from_cache() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         *app.models_cache.write().await = Some(vec![crate::models::ModelInfo {
@@ -3207,6 +3247,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_accepts_claude_code_adaptive_thinking() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
 
@@ -3236,6 +3277,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_disabled_thinking_skips_backend_thinking_field() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         *app.models_cache.write().await = Some(vec![crate::models::ModelInfo {
@@ -3265,6 +3307,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_unknown_content_blocks_degrade_to_text_placeholders() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3328,6 +3371,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_truncates_stop_sequences_for_backend_payload() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3352,6 +3396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_translates_documents_for_backend_payload() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3702,6 +3747,7 @@ mod tests {
     }
     #[test]
     fn test_parse_claude_content_blocks_array_with_malformed_block() {
+            crate::test_log::init_test_logger();
         let blocks = parse_claude_content_blocks(
             &json!([{"type": "unknown_type", "data": "test"}]),
             "assistant",
@@ -3720,22 +3766,27 @@ mod tests {
     // ========================================================================
     #[test]
     fn test_normalize_reasoning_effort_none() {
+            crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(None), None);
     }
     #[test]
     fn test_normalize_reasoning_effort_empty() {
+            crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(Some("")), None);
     }
     #[test]
     fn test_normalize_reasoning_effort_whitespace() {
+            crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(Some("   ")), None);
     }
     #[test]
     fn test_normalize_reasoning_effort_uppercase() {
+            crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(Some("HIGH")), Some("high".into()));
     }
     #[test]
     fn test_normalize_reasoning_effort_with_spaces() {
+            crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(Some("  medium  ")), Some("medium".into()));
     }
 
@@ -3744,31 +3795,38 @@ mod tests {
     // ========================================================================
     #[test]
     fn test_default_document_filename_pdf() {
+            crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("application/pdf"), "document.pdf");
     }
     #[test]
     fn test_default_document_filename_text() {
+            crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("text/plain"), "document.txt");
     }
     #[test]
     fn test_default_document_filename_markdown() {
+            crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("text/markdown"), "document.md");
     }
     #[test]
     fn test_default_document_filename_json() {
+            crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("application/json"), "document.json");
     }
     #[test]
     fn test_default_document_filename_custom() {
+            crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("image/png"), "document.png");
     }
     #[test]
     fn test_default_document_filename_unknown_with_slash() {
+            crate::test_log::init_test_logger();
         // "application/x-custom" → rsplit('/') gives "x-custom" → filter alphanumeric gives "xcustom"
         assert_eq!(default_document_filename("application/x-custom"), "document.xcustom");
     }
     #[test]
     fn test_default_document_filename_no_slash() {
+            crate::test_log::init_test_logger();
         // "unknown" has no slash → falls back to "bin" extension
         assert_eq!(default_document_filename("unknown"), "document.bin");
     }
@@ -3853,6 +3911,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_system_prompt_too_large_returns_error() {
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let big_system = "x".repeat(100 * 1024 + 1);
         let request = request_from_value(json!({
@@ -3871,6 +3930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_anthropic_oauth_token_rejected() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"));
@@ -3890,6 +3950,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_anthropic_oauth_token_rejected() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"));
@@ -3905,6 +3966,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_empty_messages_returns_error_tuple() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -3918,6 +3980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_too_many_messages_returns_error_tuple() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let msgs: Vec<Value> = (0..100_001)
             .map(|_| json!({"role": "user", "content": "x"}))
@@ -3934,6 +3997,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_content_too_large_returns_error_tuple() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let big_data = "x".repeat(5 * 1024 * 1024 + 100);
         let content = json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": big_data}}]);
@@ -3949,6 +4013,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_invalid_max_tokens_returns_error_tuple() {
+            crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -3962,6 +4027,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_system_prompt_with_cache_control() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3980,6 +4046,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_service_tier_accepted() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3996,6 +4063,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_non_retryable_non_streaming_error() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::FORBIDDEN,
             "application/json",
@@ -4019,6 +4087,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_backend_500_retryable_stream() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::INTERNAL_SERVER_ERROR,
             "application/json",
@@ -4039,6 +4108,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_backend_502_retryable_stream() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::BAD_GATEWAY,
             "application/json",
@@ -4059,6 +4129,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_backend_504_retryable_stream() {
+            crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::GATEWAY_TIMEOUT,
             "application/json",
@@ -4079,6 +4150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_404_with_empty_models_list() {
+            crate::test_log::init_test_logger();
         // When 404 but models list is empty, should fall through to generic error
         let backend_url = spawn_static_backend(
             StatusCode::NOT_FOUND,
@@ -4103,6 +4175,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_404_with_empty_models_list() {
+            crate::test_log::init_test_logger();
         // When 404 but models list is empty, falls through to generic error stream
         let backend_url = spawn_static_backend(
             StatusCode::NOT_FOUND,
@@ -4126,6 +4199,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_unexpected_content_type_warning() {
+            crate::test_log::init_test_logger();
         // Backend returns text/html — should log warning but still process
         let backend_url = spawn_static_backend(
             StatusCode::OK,
@@ -4150,6 +4224,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_image_content_block() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4174,6 +4249,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_document_missing_media_type() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4196,6 +4272,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_document_file_missing_file_id() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4217,6 +4294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_document_unknown_source_type() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4238,6 +4316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_removes_empty_assistant_placeholder() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4259,6 +4338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_system_prompt_string() {
+            crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4277,6 +4357,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_empty_response_content() {
+            crate::test_log::init_test_logger();
         // Backend returns a response with no content — should get empty text block
         let body = json!({
             "id": "chatcmpl-empty",
@@ -4309,6 +4390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_default_stream_is_true() {
+            crate::test_log::init_test_logger();
         // When stream field is omitted, it defaults to true (streaming)
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -4325,6 +4407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_reasoning_model() {
+            crate::test_log::init_test_logger();
         // Test streaming with a reasoning model to cover reasoning delta path
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -4342,6 +4425,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_tools() {
+            crate::test_log::init_test_logger();
         // Test streaming with tools to cover tool call delta path
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -4896,6 +4980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_choice_message_disconnect() {
+            crate::test_log::init_test_logger();
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
@@ -4913,6 +4998,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_tool_call_value_with_index() {
+            crate::test_log::init_test_logger();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
             next_block_index: 0, thinking_open: false, thinking_index: -1,
@@ -4927,6 +5013,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_tool_call_value_default_index() {
+            crate::test_log::init_test_logger();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
             next_block_index: 0, thinking_open: false, thinking_index: -1,
@@ -4946,6 +5033,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_non_streaming_response_in_sse() {
+            crate::test_log::init_test_logger();
         // Backend returns a complete non-streaming response inside an SSE chunk
         let body = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -4984,6 +5072,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_error_in_sse_chunk() {
+            crate::test_log::init_test_logger();
         // Backend returns an error in an SSE chunk
         let body = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -5014,6 +5103,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_non_streaming_response_and_tool_calls() {
+            crate::test_log::init_test_logger();
         // Backend returns a complete non-streaming response with tool calls in SSE
         let body = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -5670,6 +5760,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_assistant_image_block_hits_catchall() {
+            crate::test_log::init_test_logger();
         // Line 1195: an assistant message containing an image block falls into
         // the assistant-match `_ => {}` catch-all (images are not handled for
         // assistant messages).
@@ -6069,6 +6160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv_assistant_thinking_covers_three_false_branches() {
+            crate::test_log::init_test_logger();
         // Lines 1172 (signature None), 1218 (no redacted), 1230 (no text):
         // a single thinking block with no signature, no text, no redacted thinking.
         let app = test_app(spawn_mock_backend().await, false);
@@ -6086,6 +6178,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv_assistant_redacted_thinking_only() {
+            crate::test_log::init_test_logger();
         // Line 1213: assistant with only redacted_thinking → thinking_parts empty.
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -6102,6 +6195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv_user_tool_result_without_text() {
+            crate::test_log::init_test_logger();
         // Line 1154: user tool_result with no text blocks → text_parts empty.
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -6237,6 +6331,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_backend_error_text_disconnect_on_close_text() {
+            crate::test_log::init_test_logger();
         // Line 651: text_open=true (thinking closed) + dropped rx → close_text fails.
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
@@ -6430,4 +6525,132 @@ mod tests {
         assert!(body.contains("drained"));
     }
 
+    // ========================================================================
+    // Mid-stream client-disconnect paths via run_streaming_task.
+    // The streaming task body is extracted into run_streaming_task so tests
+    // can call it directly with a channel whose receiver drops after N events,
+    // exercising the tx.send().is_err() early-return branches deterministically.
+    // ========================================================================
+
+    // Helper: build a reqwest::Response whose body is a streaming SSE body
+    // with one role-chunk, one content+stop chunk with usage, then [DONE].
+    async fn make_streaming_response() -> reqwest::Response {
+        use axum::body::Body;
+        let first = json!({
+            "id": "chatcmpl-disc",
+            "object": "chat.completion.chunk",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+        });
+        let second = json!({
+            "id": "chatcmpl-disc",
+            "object": "chat.completion.chunk",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [{ "index": 0, "delta": { "content": "hi" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3 }
+        });
+        let body = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    let mut resp = Response::new(Body::from(body));
+                    resp.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap()
+    }
+
+    // disconnect before ping: receiver consumes 1 event (message_start) then
+    // drops → the ping send fails → run_streaming_task returns early.
+    #[tokio::test]
+    async fn test_streaming_disconnect_before_ping() {
+        crate::test_log::init_test_logger();
+        let res = make_streaming_response().await;
+        let (tx, handle) = recv_n_then_drop(1).await;
+        let cb = make_circuit_breaker();
+        run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    // disconnect before message_delta: receiver consumes 5 events (message_start,
+    // ping, content_block_start, content_block_delta, content_block_stop) then
+    // drops → the message_delta send fails.
+    #[tokio::test]
+    async fn test_streaming_disconnect_before_message_delta() {
+        crate::test_log::init_test_logger();
+        let res = make_streaming_response().await;
+        let (tx, handle) = recv_n_then_drop(5).await;
+        let cb = make_circuit_breaker();
+        run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    // disconnect before message_stop: receiver consumes 6 events (through
+    // message_delta) then drops → the message_stop send fails.
+    #[tokio::test]
+    async fn test_streaming_disconnect_before_message_stop() {
+        crate::test_log::init_test_logger();
+        let res = make_streaming_response().await;
+        let (tx, handle) = recv_n_then_drop(6).await;
+        let cb = make_circuit_breaker();
+        run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    // ClientDisconnected in the main loop: a backend error chunk while the
+    // receiver drops after message_start + ping → emit_backend_error_text
+    // fails → ClientDisconnected → loop breaks.
+    #[tokio::test]
+    async fn test_streaming_client_disconnected_in_loop() {
+        crate::test_log::init_test_logger();
+        use axum::body::Body;
+        let err_chunk = json!({ "error": { "message": "boom" } });
+        let body = format!("data: {err_chunk}\n\ndata: [DONE]\n\n");
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    let mut resp = Response::new(Body::from(body));
+                    resp.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let res = client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap();
+        let (tx, handle) = recv_n_then_drop(2).await;
+        let cb = make_circuit_breaker();
+        run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
 }
