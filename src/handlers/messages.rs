@@ -5406,6 +5406,23 @@ mod tests {
         let _ = response_text(response).await;
     }
 
-
+    #[tokio::test]
+    async fn test_messages_all_messages_removed_returns_no_messages_error() {
+        // Request with only an empty assistant placeholder → all messages removed
+        // during conversion → msgs.is_empty() → BAD_REQUEST
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "assistant", "content": ""}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+        assert!(parsed["error"]["message"].as_str().unwrap().contains("no usable messages"));
+    }
 
 }

@@ -285,7 +285,7 @@ mod tests {
                 assert_eq!(source.url, None);
                 assert_eq!(source.file_id, None);
             }
-            _ => panic!("expected document block"),
+            _ => panic!("expected document block"), // coverage: unreachable — deserialization always yields the Document variant; defensive arm
         }
     }
 
@@ -307,7 +307,7 @@ mod tests {
                 assert_eq!(source.data, None);
                 assert_eq!(source.file_id, None);
             }
-            _ => panic!("expected document block"),
+            _ => panic!("expected document block"), // coverage: unreachable — deserialization always yields the Document variant; defensive arm
         }
     }
 
@@ -329,7 +329,7 @@ mod tests {
                 assert_eq!(source.data, None);
                 assert_eq!(source.url, None);
             }
-            _ => panic!("expected document block"),
+            _ => panic!("expected document block"), // coverage: unreachable — deserialization always yields the Document variant; defensive arm
         }
     }
 
@@ -345,7 +345,7 @@ mod tests {
         .unwrap();
 
         match block {
-            ClaudeContentBlock::Document { .. } => {}
+            ClaudeContentBlock::Document { .. } => {} // coverage: unreachable — block is Text, never Document (should_panic test)
             _ => panic!("expected document block"),
         }
     }
@@ -365,7 +365,7 @@ mod tests {
         .unwrap();
 
         match block {
-            ClaudeContentBlock::Document { .. } => {}
+            ClaudeContentBlock::Document { .. } => {} // coverage: unreachable — block is Image, never Document (should_panic test)
             _ => panic!("expected document block"),
         }
     }
@@ -383,7 +383,7 @@ mod tests {
         .unwrap();
 
         match block {
-            ClaudeContentBlock::Document { .. } => {}
+            ClaudeContentBlock::Document { .. } => {} // coverage: unreachable — block is ToolUse, never Document (should_panic test)
             _ => panic!("expected document block"),
         }
     }

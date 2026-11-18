@@ -49,6 +49,9 @@ impl SseEventParser {
 
             // Trim newline and possible carriage return
             let mut len = line_bytes.len();
+            // coverage: condition always true — line_bytes is drained up to and
+            // including the \n, so it always ends with b'\n'; the false branch
+            // (and the closing brace below) is unreachable in practice.
             if len > 0 && line_bytes[len - 1] == b'\n' {
                 len -= 1;
                 if len > 0 && line_bytes[len - 1] == b'\r' {

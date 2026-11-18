@@ -106,6 +106,8 @@ pub fn build_model_list_content(
         let mut result = String::new();
         let half = models.len().div_ceil(2);
         for i in 0..half {
+            // coverage: models.get(i) is always Some because i < half = div_ceil(len/2)
+            // <= len; the None branch (and the closing brace below) is unreachable.
             if let Some(&left_model) = models.get(i) {
                 let left_price = crate::constants::get_price_tier(
                     left_model.input_price_usd,
