@@ -701,8 +701,7 @@ async fn process_choice_message(
         // append_non_stream_text_content only pushes {"type":"text","text":..} blocks,
         // so block.get("text").as_str() is always Some.
         if let Some(text) = block.get("text").and_then(Value::as_str) {
-            if !stream_text_delta(tx, state, text).await { return false; }
-        }
+            if !stream_text_delta(tx, state, text).await { return false; } }
     }
 
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -6344,10 +6343,11 @@ mod tests {
     }
 
     // Receiver that consumes exactly n events then drops, so the (n+1)th send fails.
-    // Uses capacity 0 so every send blocks until the receiver actively takes it —
-    // this makes the (n+1)th send deterministically fail (no race with buffering).
+    // With capacity 1, the sender's second send blocks when the buffer is full,
+    // yielding to the receiver — this makes the (n+1)th send deterministically
+    // fail after the receiver drops (the receiver runs while the sender blocks).
     async fn recv_n_then_drop(n: usize) -> (tokio::sync::mpsc::Sender<Event>, tokio::task::JoinHandle<()>) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(0);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         let handle = tokio::spawn(async move {
             let mut rx = rx;
             for _ in 0..n {
