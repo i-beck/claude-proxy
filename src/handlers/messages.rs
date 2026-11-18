@@ -5800,4 +5800,66 @@ mod tests {
         // Let the spawned streaming task run and hit the failed send.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+
+    #[tokio::test]
+    async fn test_messages_streaming_non_json_large_chunk_preview() {
+        // Line 776: a chunk that is not valid JSON at all and exceeds 500 chars
+        // hits the outer JSON-parse-failed preview (truncated to 500 chars).
+        crate::test_log::init_test_logger();
+        let garbage = "x".repeat(600);
+        let body = format!("data: {}\n\ndata: [DONE]\n\n", garbage);
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, _b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_backend_stream_error() {
+        // Lines 1893/1894: a backend that sends a partial chunked response then
+        // drops the connection causes reqwest's bytes_stream to yield an Err,
+        // hitting the "Error reading chunk from stream" path.
+        crate::test_log::init_test_logger();
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // consume the request
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // send a partial chunked response with NO terminating 0-chunk, then
+            // drop the socket so reqwest sees an incomplete chunked body (Err).
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+                .await;
+            let partial = b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+            let _ = sock.write_all(format!("{:X}\r\n", partial.len()).as_bytes()).await;
+            let _ = sock.write_all(partial).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // abrupt close — no terminating chunk
+            sock.shutdown().await.ok();
+        });
+        let app = test_app(format!("http://{addr}/v1/chat/completions"), false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, _b) = response_text(r).await;
+        // The stream still completes (the handler closes blocks and finishes)
+        assert_eq!(status, StatusCode::OK);
+    }
 }
