@@ -121,6 +121,8 @@ pub fn extract_text_from_content(content: &Value) -> (String, usize) {
                             texts.push(name.to_string());
                         }
                         if let Some(input) = obj.get("input") {
+                            // coverage: serde_json::to_string(input) always succeeds for a
+                            // valid Value, so the `if let Ok` false branch below is unreachable.
                             if let Ok(input_str) = serde_json::to_string(input) {
                                 texts.push(input_str);
                             }
@@ -514,6 +516,16 @@ mod tests {
         let content = json!(["a bare string", {"type": "text", "text": "block"}]);
         let (text, images) = extract_text_from_content(&content);
         assert_eq!(text, "a bare string\nblock");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_array_with_non_string_non_object_element() {
+        // Line 133: array element that is neither an object nor a string (e.g. a number)
+        // → both `block.as_object()` and `block.as_str()` are None → the else-if false branch.
+        let content = json!([42, {"type": "text", "text": "block"}]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "block");
         assert_eq!(images, 0);
     }
 
