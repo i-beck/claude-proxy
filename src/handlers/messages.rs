@@ -1073,9 +1073,7 @@ async fn run_streaming_task(
     log::debug!("🔄 Draining remaining backend stream...");
     let mut drained_bytes = 0;
     while let Some(item) = bytes_stream.next().await {
-        if let Ok(chunk) = item {
-            drained_bytes += chunk.len();
-        }
+        drained_bytes += item.unwrap_or_default().len();
     }
     if drained_bytes > 0 {
         log::debug!(
@@ -1737,39 +1735,38 @@ pub async fn messages(
 
     // Debug request body (large inline media/file data truncated)
     if log::log_enabled!(log::Level::Debug) {
-        if let Ok(mut json_body) = serde_json::to_string_pretty(&oai) {
-            for needle in ["\"url\": \"data:", "\"file_data\": \"data:"] {
-                if let Some(start) = json_body.find(needle) {
-                    let after = &json_body[start + needle.len()..];
-                    if let Some(end_quote) = after.find('"') {
-                        if end_quote > 120 {
-                            let replace = format!("{}{}...TRUNCATED...\"", needle, &after[..120]);
-                            let end_abs = start + needle.len() + end_quote + 1;
-                            json_body.replace_range(start..end_abs, &replace);
-                        }
+        let mut json_body = serde_json::to_string_pretty(&oai).unwrap_or_default();
+        for needle in ["\"url\": \"data:", "\"file_data\": \"data:"] {
+            if let Some(start) = json_body.find(needle) {
+                let after = &json_body[start + needle.len()..];
+                if let Some(end_quote) = after.find('"') {
+                    if end_quote > 120 {
+                        let replace = format!("{}{}...TRUNCATED...\"", needle, &after[..120]);
+                        let end_abs = start + needle.len() + end_quote + 1;
+                        json_body.replace_range(start..end_abs, &replace);
                     }
                 }
             }
-            if json_body.contains("\"image_url\"") || json_body.contains("\"file_data\"") {
-                log::info!("📸 Request contains inline media or file data (truncated in logs)");
-            }
-            // client_key is always Some here (auth check rejected None above).
-            let auth_header_str = client_key
-                .as_ref()
-                .map(|k| format!("Bearer {}", mask_token(k)))
-                .unwrap_or("Not Set".to_string());
-            log::debug!(
-                "\n------------------ Request to Backend ------------------\n\
-                 POST {}\n\
-                 Authorization: {}\n\
-                 Content-Type: application/json\n\n\
-                 {}\n\
-                 ------------------------------------------------------------",
-                app.backend_url,
-                auth_header_str,
-                json_body
-            );
         }
+        if json_body.contains("\"image_url\"") || json_body.contains("\"file_data\"") {
+            log::info!("📸 Request contains inline media or file data (truncated in logs)");
+        }
+        // client_key is always Some here (auth check rejected None above).
+        let auth_header_str = client_key
+            .as_ref()
+            .map(|k| format!("Bearer {}", mask_token(k)))
+            .unwrap_or("Not Set".to_string());
+        log::debug!(
+            "\n------------------ Request to Backend ------------------\n\
+             POST {}\n\
+             Authorization: {}\n\
+             Content-Type: application/json\n\n\
+             {}\n\
+             ------------------------------------------------------------",
+            app.backend_url,
+            auth_header_str,
+            json_body
+        );
     }
 
     log::debug!(
@@ -2059,12 +2056,11 @@ pub async fn messages(
     ));
 
     // Log structured metrics
-    if let Ok(elapsed) = request_start.elapsed() {
-        log::info!(target: "metrics",
-            "request_completed: model={}, duration_ms={}, messages={}, status=success",
-            backend_model_for_metrics, elapsed.as_millis(), original_message_count
-        );
-    }
+    let elapsed = request_start.elapsed().unwrap_or_default();
+    log::info!(target: "metrics",
+        "request_completed: model={}, duration_ms={}, messages={}, status=success",
+        backend_model_for_metrics, elapsed.as_millis(), original_message_count
+    );
 
     Ok(into_sse_response(rx))
 }
@@ -2329,14 +2325,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
-        let models_url = format!("http://{addr}/v1/models");
-        let client = reqwest::Client::new();
-        for _ in 0..20 {
-            if client.get(&models_url).send().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        // Give the spawned server a moment to start accepting connections.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         format!("http://{addr}/v1/chat/completions")
     }
@@ -2420,14 +2410,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
-        let models_url = format!("http://{addr}/v1/models");
-        let client = reqwest::Client::new();
-        for _ in 0..20 {
-            if client.get(&models_url).send().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        // Give the spawned server a moment to start accepting connections.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         (format!("http://{addr}/v1/chat/completions"), captured)
     }
@@ -5819,12 +5803,7 @@ mod tests {
             )
             .route("/v1/models", get(|| async { Json(json!({ "data": [] })) }));
         tokio::spawn(async move { let _ = axum::serve(listener, router).await; });
-        let models_url = format!("http://{addr}/v1/models");
-        let client = reqwest::Client::new();
-        for _ in 0..20 {
-            if client.get(&models_url).send().await.is_ok() { break; }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut app = test_app(format!("http://{addr}/v1/chat/completions"), false);
         app.backend_host_header = Some("custom.example.com".into());
@@ -6489,13 +6468,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
         let backend_url = format!("http://{addr}/v1/chat/completions");
-        let client = reqwest::Client::new();
-        for _ in 0..20 {
-            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -6553,13 +6526,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
-        for _ in 0..20 {
-            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
         client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap()
     }
 
@@ -6626,13 +6594,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
-        for _ in 0..20 {
-            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
         let res = client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap();
         let (tx, handle) = recv_n_then_drop(2).await;
         let cb = make_circuit_breaker();
@@ -6670,13 +6633,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
-        for _ in 0..20 {
-            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
         let res = client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap();
         // Consume message_start + ping (2 events), then drop → the flush
         // error-text send fails → ClientDisconnected.
@@ -6723,6 +6681,142 @@ mod tests {
         let (tx, handle) = recv_n_then_drop(5).await;
         drop(tx); // sender dropped → rx.recv() returns None → break
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    // ========================================================================
+    // Drain trailing bytes after [DONE] via a DIRECT run_streaming_task call
+    // (covers the drain loop's `drained_bytes += chunk.len()` arm). The backend
+    // yields the [DONE]-terminated SSE stream in one chunk and trailing bytes in
+    // a LATER, delayed chunk so reqwest delivers them as separate bytes_stream
+    // items. The receiver stays alive, so the task reaches message_stop and
+    // then the drain loop reads the trailing chunk.
+    // ========================================================================
+    #[tokio::test]
+    async fn test_run_streaming_task_drains_trailing_bytes() {
+        crate::test_log::init_test_logger();
+        use axum::body::Body;
+        use futures::stream::{self, StreamExt as _};
+
+        let first = json!({
+            "id": "chatcmpl-rst-drain",
+            "object": "chat.completion.chunk",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+        });
+        let second = json!({
+            "id": "chatcmpl-rst-drain",
+            "object": "chat.completion.chunk",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [{ "index": 0, "delta": { "content": "drained" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3 }
+        });
+        let chunk1 = format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n").into_bytes();
+        let chunk2 = b"trailing-garbage-after-done".to_vec();
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let c1 = chunk1.clone();
+                let c2 = chunk2.clone();
+                async move {
+                    // Yield chunk1 immediately, then chunk2 after a delay so
+                    // reqwest cannot coalesce them into one bytes_stream item.
+                    let s = stream::iter(vec![Ok::<_, std::convert::Infallible>(c1)])
+                        .chain(stream::once(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                            Ok::<_, std::convert::Infallible>(c2)
+                        }));
+                    let mut resp = Response::new(Body::from_stream(s));
+                    resp.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
+        let cb = make_circuit_breaker();
+        run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
+        // message_stop was sent → the drain loop ran afterward. Count events:
+        // message_start, ping, content_block_start, content_block_delta,
+        // content_block_stop, message_delta, message_stop.
+        let mut count = 0;
+        while rx.recv().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 7);
+    }
+
+    // ========================================================================
+    // Flush FatalError arm via a DIRECT run_streaming_task call (covers the
+    // `StreamPayloadOutcome::FatalError => { fatal_error = true; }` branch in
+    // the flush block). A backend that sends a role chunk then a trailing error
+    // chunk WITHOUT a final blank line (no [DONE]). The receiver stays alive, so
+    // when flush() processes the buffered error, emit_backend_error_text
+    // succeeds → FatalError → fatal_error = true (circuit-breaker success skip).
+    // ========================================================================
+    #[tokio::test]
+    async fn test_run_streaming_task_flush_fatal_error() {
+        crate::test_log::init_test_logger();
+        use axum::body::Body;
+
+        let role = json!({
+            "id": "chatcmpl-rst-flush",
+            "object": "chat.completion.chunk",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+        });
+        let err = json!({ "error": { "message": "flushed fatal error", "type": "server_error" } });
+        // No final blank line after the error → flush() picks it up.
+        let body = format!("data: {role}\n\ndata: {err}");
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    let mut resp = Response::new(Body::from(body));
+                    resp.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(64);
+        let cb = make_circuit_breaker();
+        run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
+        // message_start, ping, content_block_start(err), content_block_delta(err),
+        // content_block_stop(err), message_delta, message_stop.
+        let mut count = 0;
+        while rx.recv().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 7);
     }
 
 }

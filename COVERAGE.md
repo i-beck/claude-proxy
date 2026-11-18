@@ -2,9 +2,9 @@
 
 ## Summary
 
-- **Rust unit/integration tests:** 540 (`cargo test`), all passing.
+- **Rust unit/integration tests:** 544 (`cargo test`), all passing.
 - **Shell installer tests:** 32 (`bash tests/test_install_script.sh`), all passing.
-- **Line coverage (`cargo llvm-cov`):** 99.57% of `src/` (8193 / 8228 lines).
+- **Line coverage (`cargo llvm-cov`):** 99.71% of `src/` (8244 / 8268 lines).
 - **TDD discipline:** every new test was written to exercise a specific
   previously-uncovered branch (RED → GREEN). Two real bugs were found and
   fixed test-first:
@@ -38,26 +38,16 @@
 ## What is and isn't at 100%
 
 `100%` is treated as an asymptotic goal (per the TDD rules). The remaining
-~0.43% of uncovered lines (35 lines: 11 production, 24 test-only) fall into
-four documented categories — none are untested *production logic*:
+~0.29% of uncovered lines (24 lines: 6 production closing-brace artifacts,
+13 test-only, 5 documented-unreachable) are all tool artifacts or defensive
+code — none are untested *production logic*:
 
-### 1. Mid-stream client-disconnect paths (mostly covered via run_streaming_task)
-The streaming task was extracted into `run_streaming_task` (taking the channel
-sender and circuit breaker as parameters) so tests can call it directly with a
-dropped receiver, making the `tx.send().is_err()` early-return branches
-deterministic. This covered the disconnect-before-message_start,
-disconnect-before-ping, disconnect-before-message_delta, and
-disconnect-before-message_stop paths, plus the `ClientDisconnected` arm of the
-main SSE loop.
-
-One path remains uncovered:
-- the `ClientDisconnected` arm of the flush path (`messages.rs:1003`):
-  `StreamPayloadOutcome::ClientDisconnected => {}`. This requires the flush()
-  path to process an error chunk whose emission fails because the receiver was
-  dropped — a narrow timing window between the main loop ending and the flush
-  running. The `test_messages_streaming_flush_client_disconnected_without_final_blank_line`
-  test attempts this via a raw-socket backend with timing delays, but the race
-  between the task and the receiver drop makes it non-deterministic.
+### 1. llvm-cov closing-brace artifacts (6 production lines)
+`messages.rs:1078,1640,1750,1772,1773,2067` — `}` lines that close
+`if let`/`match`/`log::debug!` arms. llvm-cov attributes the closing brace to a
+sub-region (the "arm end" / "not-taken" counter) whose attribution does not
+line up with a single source line. Both the taken and not-taken paths of
+every branch are exercised by tests.
 
 ### 2. Unreachable defensive fallbacks (documented inline with `// coverage:`)
 - `messages.rs:1541` — `unwrap_or_else(|| "Not Set")` for the auth header in
@@ -107,8 +97,8 @@ logic: `messages.rs:705,773,1079,1641,1751,1773,1774,2068`,
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test                                   # 540 passed
-cargo llvm-cov --lcov --output-path cov.lcov # ~99.6% line coverage
+cargo test                                   # 544 passed
+cargo llvm-cov --lcov --output-path cov.lcov # ~99.7% line coverage
 bash tests/test_install_script.sh            # 32 passed
 ```
 
