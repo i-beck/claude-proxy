@@ -149,4 +149,67 @@ mod tests {
 
         send_synthetic_text_response(&tx, "model", "content", "error", 1, 1).await;
     }
+
+    #[tokio::test]
+    async fn test_send_synthetic_text_response_disconnect_after_message_start() {
+        // Cover the early return at content_block_start send failure (line 59).
+        // With a cap-1 channel the sender is at most one message ahead: send 1
+        // (message_start) buffers immediately, send 2 (content_block_start)
+        // blocks on the full slot. We hold rx (taking nothing), let send 2
+        // block, then drop rx so send 2 fails deterministically.
+        let (tx, rx) = mpsc::channel::<Event>(1);
+        let mut rx = rx;
+        let sender = tokio::spawn(async move {
+            send_synthetic_text_response(&tx, "model", "content", "end_turn", 1, 1).await;
+        });
+        // send 1 buffers; send 2 blocks. Give it a moment to block.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(rx); // send 2 (content_block_start) fails → return at line 59
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_send_synthetic_text_response_disconnect_after_block_start() {
+        // Cover the early return at content_block_delta send failure (line 76).
+        let (tx, rx) = mpsc::channel::<Event>(1);
+        let mut rx = rx;
+        let sender = tokio::spawn(async move {
+            send_synthetic_text_response(&tx, "model", "content", "end_turn", 1, 1).await;
+        });
+        let _ = rx.recv().await; // message_start → send 2 buffers, send 3 blocks
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(rx); // send 3 (content_block_delta) fails → return at line 76
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_send_synthetic_text_response_disconnect_after_delta() {
+        // Cover the early return at content_block_stop send failure (line 89).
+        let (tx, rx) = mpsc::channel::<Event>(1);
+        let mut rx = rx;
+        let sender = tokio::spawn(async move {
+            send_synthetic_text_response(&tx, "model", "content", "end_turn", 1, 1).await;
+        });
+        let _ = rx.recv().await; // message_start
+        let _ = rx.recv().await; // content_block_start → send 4 blocks
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(rx); // send 4 (content_block_stop) fails → return at line 89
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sender).await;
+    }
+
+    #[tokio::test]
+    async fn test_send_synthetic_text_response_disconnect_after_block_stop() {
+        // Cover the early return at message_delta send failure (line 106).
+        let (tx, rx) = mpsc::channel::<Event>(1);
+        let mut rx = rx;
+        let sender = tokio::spawn(async move {
+            send_synthetic_text_response(&tx, "model", "content", "end_turn", 1, 1).await;
+        });
+        let _ = rx.recv().await; // message_start
+        let _ = rx.recv().await; // content_block_start
+        let _ = rx.recv().await; // content_block_delta → send 5 blocks
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(rx); // send 5 (message_delta) fails → return at line 106
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), sender).await;
+    }
 }

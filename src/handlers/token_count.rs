@@ -50,4 +50,75 @@ mod tests {
         let axum::Json(body) = count_tokens(State(app), axum::Json(request)).await.unwrap();
         assert!(body["input_tokens"].as_u64().unwrap() > 0);
     }
+    #[tokio::test]
+    async fn test_count_tokens_with_system_prompt() {
+        let app = test_app();
+        let request = ClaudeTokenCountRequest {
+            model: "zai-org/GLM-4.5-Air".into(),
+            messages: vec![ClaudeMessage {
+                role: "user".into(),
+                content: json!("hello"),
+            }],
+            system: Some(json!("You are a helpful assistant")),
+            tools: None,
+        };
+        let axum::Json(body) = count_tokens(State(app), axum::Json(request)).await.unwrap();
+        assert!(body["input_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_tokens_with_tools() {
+        let app = test_app();
+        let request = ClaudeTokenCountRequest {
+            model: "zai-org/GLM-4.5-Air".into(),
+            messages: vec![ClaudeMessage {
+                role: "user".into(),
+                content: json!("use a tool"),
+            }],
+            system: None,
+            tools: Some(vec![crate::models::ClaudeTool {
+                name: "calculator".into(),
+                description: Some("A calculator".into()),
+                input_schema: json!({"type": "object", "properties": {"expr": {"type": "string"}}}),
+            }]),
+        };
+        let axum::Json(body) = count_tokens(State(app), axum::Json(request)).await.unwrap();
+        assert!(body["input_tokens"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_tokens_empty_messages() {
+        let app = test_app();
+        let request = ClaudeTokenCountRequest {
+            model: "zai-org/GLM-4.5-Air".into(),
+            messages: vec![],
+            system: None,
+            tools: None,
+        };
+        let axum::Json(body) = count_tokens(State(app), axum::Json(request)).await.unwrap();
+        // Empty messages → zero tokens
+        assert_eq!(body["input_tokens"].as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_tokens_with_multimodal_content() {
+        let app = test_app();
+        let request = ClaudeTokenCountRequest {
+            model: "zai-org/GLM-4.5-Air".into(),
+            messages: vec![ClaudeMessage {
+                role: "user".into(),
+                content: json!([
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+                ]),
+            }],
+            system: None,
+            tools: None,
+        };
+        let axum::Json(body) = count_tokens(State(app), axum::Json(request)).await.unwrap();
+        // Should include image tokens (85 per image)
+        assert!(body["input_tokens"].as_u64().unwrap() > 85);
+    }
+
+
 }

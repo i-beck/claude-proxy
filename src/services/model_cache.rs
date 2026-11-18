@@ -236,4 +236,138 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "fetched-model");
     }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_sends_host_header_when_configured() {
+        // Line 35-37: backend_host_header is forwarded to the models request
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received_host = Arc::new(RwLock::new(None::<String>));
+        let received_host_clone = received_host.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let received_host = received_host_clone.clone();
+                async move {
+                    *received_host.write().await =
+                        headers.get("host").and_then(|v| v.to_str().ok()).map(String::from);
+                    Json(json!({ "data": [] }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut app_with_host = make_app(
+            format!("http://{addr}/v1/chat/completions"),
+            None,
+        );
+        app_with_host.backend_host_header = Some("custom-host.example.com".into());
+
+        refresh_models_cache(&app_with_host).await.unwrap();
+        let host = received_host.read().await;
+        assert_eq!(host.as_deref(), Some("custom-host.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_handles_long_error_body() {
+        // Line 39: error_text.len() > 200 branch in the warn! log
+        let long_error = "x".repeat(300);
+        let backend_url = spawn_models_server(
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": long_error }),
+        )
+        .await;
+        let app = make_app(backend_url, None);
+        let result = refresh_models_cache(&app).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_models_url_from_backend_url_trailing_slash() {
+        assert_eq!(
+            models_url_from_backend_url("http://localhost:8000/v1/chat/completions/"),
+            "http://localhost:8000/v1/models"
+        );
+    }
+    fn make_app_with_host_header(backend_url: String, host_header: Option<String>) -> App {
+        App {
+            client: reqwest::Client::new(),
+            backend_url,
+            backend_host_header: host_header,
+            models_cache: Arc::new(RwLock::new(None)),
+            circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState::new(false))),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_no_price_no_pricing() {
+        let backend_url = spawn_models_server(
+            StatusCode::OK,
+            json!({"data": [{"id": "free-model", "supported_features": ["tools"]}]}),
+        ).await;
+        let app = make_app(backend_url, None);
+        refresh_models_cache(&app).await.unwrap();
+        let cache = app.models_cache.read().await;
+        let model = &cache.as_ref().unwrap()[0];
+        assert_eq!(model.id, "free-model");
+        assert_eq!(model.input_price_usd, None);
+        assert_eq!(model.output_price_usd, None);
+        assert_eq!(model.supported_features, vec!["tools".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_no_supported_features() {
+        let backend_url = spawn_models_server(
+            StatusCode::OK,
+            json!({"data": [{"id": "basic-model", "price": {"input": {"usd": 0.5}, "output": {"usd": 1.0}}}]}),
+        ).await;
+        let app = make_app(backend_url, None);
+        refresh_models_cache(&app).await.unwrap();
+        let cache = app.models_cache.read().await;
+        let model = &cache.as_ref().unwrap()[0];
+        assert_eq!(model.id, "basic-model");
+        assert_eq!(model.input_price_usd, Some(0.5));
+        assert_eq!(model.output_price_usd, Some(1.0));
+        assert!(model.supported_features.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_models_with_id_only() {
+        let backend_url = spawn_models_server(
+            StatusCode::OK,
+            json!({"data": [{"id": "minimal"}]}),
+        ).await;
+        let app = make_app(backend_url, None);
+        refresh_models_cache(&app).await.unwrap();
+        let cache = app.models_cache.read().await;
+        assert_eq!(cache.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_models_cache_no_data_field() {
+        let backend_url = spawn_models_server(
+            StatusCode::OK,
+            json!({"not_data": "wrong"}),
+        ).await;
+        let app = make_app(backend_url, None);
+        refresh_models_cache(&app).await.unwrap();
+        let cache = app.models_cache.read().await;
+        // data field missing → empty models list
+        assert_eq!(cache.as_ref().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_available_models_returns_empty_vec_on_backend_error() {
+        let backend_url = spawn_models_server(
+            StatusCode::BAD_GATEWAY,
+            json!({"error": "unavailable"}),
+        ).await;
+        let app = make_app(backend_url, None);
+        let models = get_available_models(&app).await;
+        assert!(models.is_empty());
+    }
+
+
 }

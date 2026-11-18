@@ -199,4 +199,218 @@ mod tests {
         assert!(content.contains("zai-org/GLM-4.5-Air"));
         assert!(content.contains("To switch models"));
     }
+
+    #[test]
+    fn test_format_backend_error_with_invalid_json_raw() {
+        // Line 9: raw_json is not valid JSON → model_name = None
+        let message = format_backend_error("some error", "not-json-at-all");
+        assert!(message.contains("⚠️ Backend Error"));
+        assert!(message.contains("Error: some error"));
+        // Should NOT contain "Model:" since model_name is None
+        assert!(!message.contains("Model:"));
+    }
+
+    #[test]
+    fn test_format_backend_error_token_exceed_without_limit() {
+        // Line 28: "total of X tokens" present but "maximum context length" absent
+        let message = format_backend_error(
+            "requested a total of 120000 tokens which exceed",
+            "{}",
+        );
+        assert!(message.contains("Requested: 120000"));
+        // No "Limit:" since "maximum context length of" is not in the message
+        assert!(!message.contains("Limit:"));
+    }
+
+    #[test]
+    fn test_format_backend_error_token_exceed_without_requested() {
+        // Line 35: "maximum context length" present but "total of" absent
+        let message = format_backend_error(
+            "token exceed maximum context length of 64000 tokens",
+            "{}",
+        );
+        assert!(message.contains("Limit: 64000"));
+        // No "Requested:" since "total of" is not in the message
+        assert!(!message.contains("Requested:"));
+    }
+
+    #[test]
+    fn test_format_backend_error_generic_no_suggestions() {
+        // None of the special cases match → no suggestions
+        let message = format_backend_error("some random error", "{}");
+        assert!(message.contains("Error: some random error"));
+        assert!(!message.contains("💡"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_empty_models() {
+        // Line 139: empty models list — no reasoning or standard sections
+        let content = build_model_list_content("ghost-model", &[]);
+        assert!(content.contains("Model `ghost-model` not found"));
+        assert!(content.contains("0 total"));
+        assert!(!content.contains("### 🧠 REASONING"));
+        assert!(!content.contains("### ⚡ STANDARD"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_model_without_slash() {
+        // Line 93: model IDs without '/' separator (e.g., "deepseek-r1")
+        let models = vec![
+            ModelInfo {
+                id: "model-a".into(),
+                input_price_usd: Some(0.1),
+                output_price_usd: Some(0.2),
+                supported_features: vec![],
+            },
+            ModelInfo {
+                id: "model-b".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec!["reasoning".into()],
+            },
+        ];
+        let content = build_model_list_content("test", &models);
+        assert!(content.contains("model-a"));
+        assert!(content.contains("model-b"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_same_prefix_different_suffix() {
+        // Lines 95-99: sort comparison where first parts are equal
+        let models = vec![
+            ModelInfo {
+                id: "org/zzz".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec![],
+            },
+            ModelInfo {
+                id: "org/aaa".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec![],
+            },
+        ];
+        let content = build_model_list_content("test", &models);
+        // Both should appear; sort is by first part then reverse by second
+        assert!(content.contains("org/zzz"));
+        assert!(content.contains("org/aaa"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_odd_count_no_right_column() {
+        // Line 125: odd number of models → last row has no right column
+        let models: Vec<ModelInfo> = (0..3).map(|i| ModelInfo {
+            id: format!("model-{i}"),
+            input_price_usd: None,
+            output_price_usd: None,
+            supported_features: vec![],
+        }).collect();
+        let content = build_model_list_content("test", &models);
+        assert!(content.contains("model-0"));
+        assert!(content.contains("model-1"));
+        assert!(content.contains("model-2"));
+    }
+    #[test]
+    fn test_format_backend_error_no_model_in_raw() {
+        let message = format_backend_error("some error", "not json");
+        assert!(message.contains("Error: some error"));
+        assert!(!message.contains("Model:"));
+    }
+
+    #[test]
+    fn test_format_backend_error_token_exceed_without_numbers() {
+        // Has 'token' and 'exceed' but not the specific patterns
+        let message = format_backend_error("token limit exceed", "{}");
+        assert!(message.contains("token limit exceed"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_only_reasoning() {
+        let models = vec![ModelInfo {
+            id: "deepseek-r1".into(),
+            input_price_usd: Some(0.2),
+            output_price_usd: Some(0.4),
+            supported_features: vec!["reasoning".into()],
+        }];
+        let content = build_model_list_content("missing", &models);
+        assert!(content.contains("REASONING"));
+        assert!(!content.contains("STANDARD"));
+        assert!(content.contains("deepseek-r1"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_only_standard() {
+        let models = vec![ModelInfo {
+            id: "zai-org/GLM-4.5-Air".into(),
+            input_price_usd: Some(0.1),
+            output_price_usd: Some(0.2),
+            supported_features: vec![],
+        }];
+        let content = build_model_list_content("missing", &models);
+        assert!(!content.contains("REASONING"));
+        assert!(content.contains("STANDARD"));
+        assert!(content.contains("zai-org/GLM-4.5-Air"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_empty() {
+        let content = build_model_list_content("missing", &[]);
+        assert!(content.contains("0 total"));
+        assert!(content.contains("To switch models"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_odd_count() {
+        let models = vec![
+            ModelInfo { id: "a/model1".into(), input_price_usd: None, output_price_usd: None, supported_features: vec![] },
+            ModelInfo { id: "b/model2".into(), input_price_usd: None, output_price_usd: None, supported_features: vec![] },
+            ModelInfo { id: "c/model3".into(), input_price_usd: None, output_price_usd: None, supported_features: vec![] },
+        ];
+        let content = build_model_list_content("missing", &models);
+        assert!(content.contains("model1"));
+        assert!(content.contains("model2"));
+        assert!(content.contains("model3"));
+    }
+
+    #[test]
+    fn test_format_backend_error_with_no_suggestions() {
+        let message = format_backend_error("unknown error type", r#"{"model":"test"}"#);
+        assert!(message.contains("Model: test"));
+        assert!(message.contains("Error: unknown error type"));
+        assert!(!message.contains("Suggestions"));
+    }
+
+    #[test]
+    fn test_format_backend_error_invalid_json_omits_model() {
+        // Line 9: raw_json is not valid JSON → model_name is None → no "Model:" line.
+        let message = format_backend_error("some error", "not-valid-json");
+        assert!(!message.contains("Model:"));
+        assert!(message.contains("Error: some error"));
+    }
+
+    #[test]
+    fn test_build_model_list_content_same_org_exercises_second_level_sort() {
+        // Lines 93-99: two models with the SAME org prefix force the sort
+        // comparison to fall through to the second-level (model-name) key.
+        let models = vec![
+            ModelInfo {
+                id: "zai-org/GLM-Beta".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec!["reasoning".into()],
+            },
+            ModelInfo {
+                id: "zai-org/GLM-Alpha".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec!["reasoning".into()],
+            },
+        ];
+        let content = build_model_list_content("missing", &models);
+        assert!(content.contains("zai-org/GLM-Beta"));
+        assert!(content.contains("zai-org/GLM-Alpha"));
+        assert!(content.contains("### 🧠 REASONING"));
+    }
+
 }

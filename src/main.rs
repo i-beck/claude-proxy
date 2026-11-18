@@ -16,6 +16,9 @@ mod utils;
 use models::{App, CircuitBreakerState};
 use services::model_cache::refresh_models_cache;
 
+#[cfg(test)]
+mod test_log;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeConfig {
     backend_url: String,
@@ -79,6 +82,11 @@ fn build_router(app: App) -> Router {
         .with_state(app)
 }
 
+// NOTE: main() is the binary entry point and cannot be unit tested.
+// The functions it calls (RuntimeConfig::from_env, build_app, build_router)
+// are individually tested in the test module below. The graceful shutdown
+// and background cache refresh task are integration concerns tested via
+// the shell-based API spec tests (test.sh --all).
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();

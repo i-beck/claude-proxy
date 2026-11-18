@@ -349,7 +349,7 @@ fn default_document_filename(media_type: &str) -> String {
     }
 }
 
-struct StreamState {
+pub(crate) struct StreamState {
     next_block_index: i32,
     thinking_open: bool,
     thinking_index: i32,
@@ -4160,5 +4160,745 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("event: message_stop"));
     }
+
+    // ========================================================================
+    // Client disconnect paths — test streaming functions with dropped receiver
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_close_thinking_block_returns_false_on_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: true, thinking_index: 0,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!close_thinking_block_if_open(&tx, &mut state, "test").await);
+        assert!(state.thinking_open);
+    }
+
+    #[tokio::test]
+    async fn test_close_thinking_block_noop_when_closed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(close_thinking_block_if_open(&tx, &mut state, "test").await);
+    }
+
+    #[tokio::test]
+    async fn test_close_text_block_returns_false_on_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: true, text_index: 0, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!close_text_block_if_open(&tx, &mut state).await);
+    }
+
+    #[tokio::test]
+    async fn test_close_text_block_noop_when_closed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(close_text_block_if_open(&tx, &mut state).await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_reasoning_delta_empty_returns_true() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(stream_reasoning_delta(&tx, &mut state, "").await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_reasoning_delta_disconnect_on_open() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_reasoning_delta(&tx, &mut state, "thinking...").await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_reasoning_delta_disconnect_on_delta() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: true, thinking_index: 0,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_reasoning_delta(&tx, &mut state, "more thinking").await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_text_delta_empty_returns_true() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(stream_text_delta(&tx, &mut state, "").await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_text_delta_disconnect_on_open() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_text_delta(&tx, &mut state, "hello").await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_text_delta_disconnect_on_delta() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: true, text_index: 0, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_text_delta(&tx, &mut state, "more text").await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_text_delta_reasoning_open_disconnect_on_close() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 1, thinking_open: true, thinking_index: 0,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_text_delta(&tx, &mut state, "hello").await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_piece_disconnect_on_close_thinking() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 1, thinking_open: true, thinking_index: 0,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_tool_call_piece(&tx, &mut state, 0, Some("id"), Some("name"), Some("{}")).await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_piece_disconnect_on_close_text() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 1, thinking_open: false, thinking_index: -1,
+            text_open: true, text_index: 0, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_tool_call_piece(&tx, &mut state, 0, Some("id"), Some("name"), Some("{}")).await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_piece_no_id_returns_true() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(4);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // No id or name → should return true without sending start
+        assert!(stream_tool_call_piece(&tx, &mut state, 0, None, None, Some("{}")).await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_piece_disconnect_on_start() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_tool_call_piece(&tx, &mut state, 0, Some("id1"), Some("tool"), Some("{}")).await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_piece_disconnect_on_args() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 1, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // Pre-populate tools map so start was already sent
+        state.tools.insert(0, ToolBuf {
+            block_index: 0, id: Some("id1".into()), name: Some("tool".into()),
+            pending_args: String::new(), has_sent_start: true,
+        });
+        assert!(!stream_tool_call_piece(&tx, &mut state, 0, None, None, Some("args")).await);
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_piece_success_with_id_and_name() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(4);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(stream_tool_call_piece(&tx, &mut state, 0, Some("call_1"), Some("read_file"), Some("{}")).await);
+        // Should have sent content_block_start and content_block_delta
+        let ev1 = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev1).contains("content_block_start"));
+        let ev2 = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev2).contains("input_json_delta"));
+    }
+
+    #[tokio::test]
+    async fn test_emit_backend_error_text_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!emit_backend_error_text(&tx, &mut state, "error", "raw").await);
+    }
+
+    #[tokio::test]
+    async fn test_emit_backend_error_text_success() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(emit_backend_error_text(&tx, &mut state, "test error", "raw").await);
+        assert_eq!(state.final_stop_reason, "error");
+        let ev1 = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev1).contains("content_block_start"));
+        let ev2 = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev2).contains("test error"));
+        let ev3 = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev3).contains("content_block_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_send_sse_json_returns_false_on_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        assert!(!send_sse_json(&tx, "test", json!({})).await);
+    }
+
+    #[tokio::test]
+    async fn test_send_sse_json_returns_true_on_success() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(1);
+        assert!(send_sse_json(&tx, "test", json!({"key": "value"})).await);
+        let ev = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev).contains("test"));
+    }
+
+    #[tokio::test]
+    async fn test_add_output_tokens_no_increment_when_backend_reported() {
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 42, backend_reported_usage: true,
+        };
+        add_output_tokens(&mut state, "some text");
+        assert_eq!(state.output_token_count, 42); // unchanged
+    }
+
+    #[tokio::test]
+    async fn test_add_output_tokens_increments_when_not_reported() {
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        add_output_tokens(&mut state, "abcdefgh"); // 8 bytes / 4 = 2 tokens
+        assert_eq!(state.output_token_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_add_output_tokens_minimum_one_token() {
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        add_output_tokens(&mut state, "a"); // 1 byte / 4 = 0, but max(1, 0) = 1
+        assert_eq!(state.output_token_count, 1);
+    }
+
+    // ========================================================================
+    // process_backend_sse_payload — error and edge case branches
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_done_marker() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(matches!(process_backend_sse_payload(&tx, &mut state, "[DONE]").await, StreamPayloadOutcome::Done));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_empty_data() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(matches!(process_backend_sse_payload(&tx, &mut state, "").await, StreamPayloadOutcome::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_invalid_json_object() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // A valid JSON object but not an OAIStreamChunk — should log warning and continue
+        let result = process_backend_sse_payload(&tx, &mut state, "{\"unexpected\": true}").await;
+        assert!(matches!(result, StreamPayloadOutcome::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_invalid_json_text() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // Not JSON at all — should log warning and continue
+        let result = process_backend_sse_payload(&tx, &mut state, "not json at all").await;
+        assert!(matches!(result, StreamPayloadOutcome::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_error_in_chunk() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // Error object in the SSE data (not a valid OAIStreamChunk)
+        let error_data = r#"{"error":{"message":"test error message","type":"test_error"}}"#;
+        let result = process_backend_sse_payload(&tx, &mut state, error_data).await;
+        assert!(matches!(result, StreamPayloadOutcome::FatalError));
+        assert_eq!(state.final_stop_reason, "error");
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_error_in_chunk_empty_message() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // Error object with empty message — should use the full error JSON
+        let error_data = r#"{"error":{"message":"","type":"test_error"}}"#;
+        let result = process_backend_sse_payload(&tx, &mut state, error_data).await;
+        assert!(matches!(result, StreamPayloadOutcome::FatalError));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_error_in_chunk_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // Error in chunk, but receiver is dropped → ClientDisconnected
+        let error_data = r#"{"error":{"message":"test error"}}"#;
+        let result = process_backend_sse_payload(&tx, &mut state, error_data).await;
+        assert!(matches!(result, StreamPayloadOutcome::ClientDisconnected));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_error_in_chunk_struct() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // Valid OAIStreamChunk with error field
+        let error_chunk = serde_json::json!({
+            "choices": [],
+            "error": {"message": "backend error in chunk", "type": "server_error"}
+        }).to_string();
+        let result = process_backend_sse_payload(&tx, &mut state, &error_chunk).await;
+        assert!(matches!(result, StreamPayloadOutcome::FatalError));
+        assert_eq!(state.final_stop_reason, "error");
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_no_choices() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let chunk = serde_json::json!({"choices": []}).to_string();
+        let result = process_backend_sse_payload(&tx, &mut state, &chunk).await;
+        assert!(matches!(result, StreamPayloadOutcome::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_no_delta_no_message() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let chunk = serde_json::json!({"choices": [{"index": 0}]}).to_string();
+        let result = process_backend_sse_payload(&tx, &mut state, &chunk).await;
+        assert!(matches!(result, StreamPayloadOutcome::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_finish_reason_updates_stop_reason() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+        }).to_string();
+        process_backend_sse_payload(&tx, &mut state, &chunk).await;
+        assert_eq!(state.final_stop_reason, "max_tokens");
+    }
+
+    #[tokio::test]
+    async fn test_process_backend_sse_payload_usage_updates_token_count() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 25, "total_tokens": 40}
+        }).to_string();
+        process_backend_sse_payload(&tx, &mut state, &chunk).await;
+        assert_eq!(state.output_token_count, 25);
+        assert!(state.backend_reported_usage);
+    }
+
+    // ========================================================================
+    // process_choice_message — non-streaming response in SSE stream
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_process_choice_message_with_text_content() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let message = json!({"role": "assistant", "content": "hello world"});
+        assert!(process_choice_message(&tx, &mut state, &message).await);
+        let ev = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev).contains("content_block_start"));
+    }
+
+    #[tokio::test]
+    async fn test_process_choice_message_with_reasoning_content() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let message = json!({"role": "assistant", "reasoning_content": "thinking about it", "content": "answer"});
+        assert!(process_choice_message(&tx, &mut state, &message).await);
+        // Should have both thinking and text events
+        let mut evs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            evs.push(ev);
+        }
+        assert!(evs.iter().any(|e| format!("{:?}", e).contains("thinking")));
+        assert!(evs.iter().any(|e| format!("{:?}", e).contains("text_delta")));
+    }
+
+    #[tokio::test]
+    async fn test_process_choice_message_with_tool_calls() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let message = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "tool", "arguments": "{}"}}]
+        });
+        assert!(process_choice_message(&tx, &mut state, &message).await);
+        let evs: Vec<_> = (0..4).filter_map(|_| rx.try_recv().ok()).collect();
+        assert!(evs.iter().any(|e| format!("{:?}", e).contains("tool_use")));
+    }
+
+    #[tokio::test]
+    async fn test_process_choice_message_with_content_array() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let message = json!({"role": "assistant", "content": [{"type": "text", "text": "part1"}, {"type": "text", "text": "part2"}]});
+        assert!(process_choice_message(&tx, &mut state, &message).await);
+        let ev = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev).contains("content_block_start"));
+    }
+
+    #[tokio::test]
+    async fn test_process_choice_message_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let message = json!({"role": "assistant", "content": "hello"});
+        assert!(!process_choice_message(&tx, &mut state, &message).await);
+    }
+
+    // ========================================================================
+    // stream_tool_call_value — tool call from Value (non-streaming path)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_stream_tool_call_value_with_index() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let tool_call = json!({"index": 0, "id": "call_1", "function": {"name": "test_tool", "arguments": "{}"}});
+        assert!(stream_tool_call_value(&tx, &mut state, 0, &tool_call).await);
+        let ev = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev).contains("content_block_start"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_value_default_index() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        // No index field — should use default_idx
+        let tool_call = json!({"id": "call_1", "function": {"name": "test_tool", "arguments": "{}"}});
+        assert!(stream_tool_call_value(&tx, &mut state, 5, &tool_call).await);
+        let ev = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev).contains("content_block_start"));
+    }
+
+    // ========================================================================
+    // Non-streaming response in SSE stream (integration test)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_messages_streaming_with_non_streaming_response_in_sse() {
+        // Backend returns a complete non-streaming response inside an SSE chunk
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "id": "chatcmpl-nonstream",
+                "object": "chat.completion",
+                "model": "zai-org/GLM-4.5-Air",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Complete response"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Complete response"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_with_error_in_sse_chunk() {
+        // Backend returns an error in an SSE chunk
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "error": {"message": "rate limit exceeded", "type": "rate_limit_error"}
+            })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("rate limit exceeded"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_with_non_streaming_response_and_tool_calls() {
+        // Backend returns a complete non-streaming response with tool calls in SSE
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "id": "chatcmpl-tools",
+                "object": "chat.completion",
+                "model": "zai-org/GLM-4.5-Air",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}}]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+            })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "read a file"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("tool_use"));
+        assert!(body.contains("read_file"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    // ========================================================================
+    // stream_tool_call_delta — test with OAIToolCallDelta
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_stream_tool_call_delta_with_function() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let tool_call = crate::models::OAIToolCallDelta {
+            index: Some(0),
+            id: Some("call_1".into()),
+            _type: Some("function".into()),
+            function: Some(crate::models::OAIToolFunctionDelta {
+                name: Some("read_file".into()),
+                arguments: Some(r#"{"path":"README"}"#.into()),
+            }),
+        };
+        assert!(stream_tool_call_delta(&tx, &mut state, &tool_call).await);
+        let ev = rx.recv().await.unwrap();
+        assert!(format!("{:?}", ev).contains("content_block_start"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_call_delta_default_index() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let tool_call = crate::models::OAIToolCallDelta {
+            index: None,
+            id: None,
+            _type: None,
+            function: None,
+        };
+        // No id, no function → should return true without sending anything
+        assert!(stream_tool_call_delta(&tx, &mut state, &tool_call).await);
+    }
+
+
 
 }

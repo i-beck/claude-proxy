@@ -859,4 +859,328 @@ mod tests {
         assert_eq!(result, Some(json!(42)));
         assert_eq!(parallel, None);
     }
+
+    #[test]
+    fn test_count_input_tokens_with_non_string_system() {
+        // Line 21: system as non-string JSON object
+        let messages = vec![];
+        let system = Some(json!({"key": "value"}));
+        let count = count_input_tokens(&messages, &system, &None);
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_input_tokens_with_empty_string_system() {
+        // Line 19-20: system is empty string → not added to text_parts
+        let messages = vec![crate::models::ClaudeMessage {
+            role: "user".into(),
+            content: json!("hello"),
+        }];
+        let system = Some(json!(""));
+        let count = count_input_tokens(&messages, &system, &None);
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_input_tokens_with_tools_with_description() {
+        // Line 37: tool with description
+        let messages = vec![];
+        let tools = Some(vec![crate::models::ClaudeTool {
+            name: "my_tool".into(),
+            description: Some("A test tool".into()),
+            input_schema: json!({"type": "object"}),
+        }]);
+        let count = count_input_tokens(&messages, &None, &tools);
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_input_tokens_with_tools_without_description() {
+        // Line 40: tool without description (None)
+        let messages = vec![];
+        let tools = Some(vec![crate::models::ClaudeTool {
+            name: "my_tool".into(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }]);
+        let count = count_input_tokens(&messages, &None, &tools);
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_input_tokens_includes_image_tokens() {
+        let messages = vec![crate::models::ClaudeMessage {
+            role: "user".into(),
+            content: json!([
+                {"type": "text", "text": "describe this"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "ZmFrZQ=="}}
+            ]),
+        }];
+        let count = count_input_tokens(&messages, &None, &None);
+        // Should include image tokens (2 images × 85 = 170) plus text tokens
+        assert!(count >= 170);
+    }
+
+    #[test]
+    fn test_extract_text_from_content_tool_result_object_items() {
+        // Line 100-104, 106-107: tool_result with array of objects and non-text items
+        let content = json!([
+            {"type": "tool_result", "content": [
+                {"type": "image", "source": {}},
+                {"type": "text", "text": "visible text"}
+            ]}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert!(text.contains("visible text"));
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_from_content_tool_result_with_string_array() {
+        // Line 112, 116-117: tool_result with array of plain strings
+        let content = json!([
+            {"type": "tool_result", "content": ["raw string", "another"]}
+        ]);
+        let (text, _) = extract_text_from_content(&content);
+        assert!(text.contains("raw string"));
+        assert!(text.contains("another"));
+    }
+
+    #[test]
+    fn test_extract_text_from_content_tool_result_non_text_non_string() {
+        // Line 123: tool_result with items that are neither objects nor strings
+        let content = json!([
+            {"type": "tool_result", "content": [42, true]}
+        ]);
+        let (text, _) = extract_text_from_content(&content);
+        // Numbers and bools in array — they're not text type and not strings
+        // so they're skipped via the else branch at line 102 (as_str returns None)
+        // Actually these are primitives, so block.as_object() is None and block.as_str() is None
+        // so nothing is extracted
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_serialize_tool_result_content_number() {
+        // Line 238: non-string, non-array value → serde_json::to_string fallback
+        let content = json!(42);
+        let result = serialize_tool_result_content(&content);
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_build_oai_tools_none() {
+        assert_eq!(build_oai_tools(None), None);
+    }
+
+    #[test]
+    fn test_build_oai_tools_empty_vec() {
+        assert_eq!(build_oai_tools(Some(vec![])), None);
+    }
+
+    #[test]
+    fn test_build_oai_tools_with_tools() {
+        let tools = Some(vec![crate::models::ClaudeTool {
+            name: "calculator".into(),
+            description: Some("A calculator".into()),
+            input_schema: json!({"type": "object"}),
+        }]);
+        let result = build_oai_tools(tools);
+        assert!(result.is_some());
+        let tools = result.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].type_, "function");
+        assert_eq!(tools[0].function.name, "calculator");
+        assert!(tools[0].function.description.is_some());
+    }
+
+    #[test]
+    fn test_convert_tool_choice_none() {
+        let (result, parallel) = convert_tool_choice(None);
+        assert_eq!(result, None);
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_tool_with_tool_name() {
+        let (result, _) = convert_tool_choice(Some(json!({
+            "type": "tool",
+            "tool_name": "my_tool"
+        })));
+        assert_eq!(result, Some(json!({
+            "type": "function",
+            "function": {"name": "my_tool"}
+        })));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_disable_parallel_false() {
+        let (result, parallel) = convert_tool_choice(Some(json!({
+            "type": "auto",
+            "disable_parallel_tool_use": false
+        })));
+        assert_eq!(result, Some(json!("auto")));
+        assert_eq!(parallel, Some(true));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_auto_with_parallel() {
+        let (result, parallel) = convert_tool_choice(Some(json!({
+            "type": "auto",
+            "disable_parallel_tool_use": true
+        })));
+        assert_eq!(result, Some(json!("auto")));
+        assert_eq!(parallel, Some(false));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_none_with_parallel() {
+        let (result, parallel) = convert_tool_choice(Some(json!({
+            "type": "none",
+            "disable_parallel_tool_use": true
+        })));
+        assert_eq!(result, Some(json!("none")));
+        assert_eq!(parallel, Some(false));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_any_with_parallel() {
+        let (result, parallel) = convert_tool_choice(Some(json!({
+            "type": "any",
+            "disable_parallel_tool_use": false
+        })));
+        assert_eq!(result, Some(json!("required")));
+        assert_eq!(parallel, Some(true));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_required_with_parallel() {
+        let (result, parallel) = convert_tool_choice(Some(json!({
+            "type": "required",
+            "disable_parallel_tool_use": true
+        })));
+        assert_eq!(result, Some(json!("required")));
+        assert_eq!(parallel, Some(false));
+    }
+    #[test]
+    fn test_count_input_tokens_empty_all() {
+        let messages: Vec<crate::models::ClaudeMessage> = vec![];
+        let count = count_input_tokens(&messages, &None, &None);
+        assert_eq!(count, 0); // empty input produces zero tokens
+    }
+
+    #[test]
+    fn test_count_input_tokens_system_non_string_value() {
+        let messages = vec![crate::models::ClaudeMessage {
+            role: "user".into(),
+            content: json!("hi"),
+        }];
+        // System as a number (non-string, non-array)
+        let count = count_input_tokens(&messages, &Some(json!(42)), &None);
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_input_tokens_tool_without_description() {
+        let messages = vec![crate::models::ClaudeMessage {
+            role: "user".into(),
+            content: json!("hi"),
+        }];
+        let tools = vec![crate::models::ClaudeTool {
+            name: "simple_tool".into(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        }];
+        let count = count_input_tokens(&messages, &None, &Some(tools));
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_build_oai_tools_empty_returns_none() {
+        assert_eq!(build_oai_tools(Some(vec![])), None);
+    }
+
+    #[test]
+    fn test_build_oai_tools_none_returns_none() {
+        assert_eq!(build_oai_tools(None), None);
+    }
+
+    #[test]
+    fn test_build_oai_tools_with_tools_returns_some() {
+        let tools = vec![crate::models::ClaudeTool {
+            name: "test".into(),
+            description: Some("desc".into()),
+            input_schema: json!({"type": "object"}),
+        }];
+        let result = build_oai_tools(Some(tools));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0].type_, "function");
+    }
+
+    #[test]
+    fn test_extract_text_tool_result_non_string_non_array() {
+        // tool_result content is a number (not string, not array)
+        let content = json!([{"type": "tool_result", "content": 42}]);
+        let (text, images) = extract_text_from_content(&content);
+        // Non-string, non-array content falls through without adding text
+        assert_eq!(text, "");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_tool_result_array_with_number_items() {
+        let content = json!([{
+            "type": "tool_result",
+            "content": [42, "text item", {"type": "text", "text": "block"}]
+        }]);
+        let (text, _images) = extract_text_from_content(&content);
+        // Number items are ignored, text items are extracted
+        assert!(text.contains("text item"));
+        assert!(text.contains("block"));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_empty_object_with_parallel() {
+        let (_result, parallel) = convert_tool_choice(Some(json!({"disable_parallel_tool_use": false})));
+        assert_eq!(parallel, Some(true));
+    }
+
+    #[test]
+    fn test_convert_tool_choice_number_value() {
+        let (result, parallel) = convert_tool_choice(Some(json!(3.14)));
+        assert_eq!(result, Some(json!(3.14)));
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn test_convert_tool_choice_object_with_name_and_tool_name() {
+        // Both name and tool_name present — name takes precedence
+        let (result, _) = convert_tool_choice(Some(json!({
+            "type": "tool",
+            "name": "primary",
+            "tool_name": "secondary"
+        })));
+        assert_eq!(
+            result,
+            Some(json!({"type": "function", "function": {"name": "primary"}}))
+        );
+    }
+
+    #[test]
+    fn test_convert_tool_choice_log_args_evaluated_with_logger() {
+        // The warn!/info! format arguments are only evaluated when a logger is
+        // registered. Install it and drive every logging branch so the
+        // argument lines execute (otherwise the macro short-circuits them).
+        crate::test_log::init_test_logger();
+        let _ = convert_tool_choice(Some(json!("mystery")));
+        let _ = convert_tool_choice(Some(json!({"name": "x"})));
+        let _ = convert_tool_choice(Some(json!({"type": "tool", "name": "calc"})));
+        let _ = convert_tool_choice(Some(json!({"type": "tool"})));
+        let _ = convert_tool_choice(Some(json!({"type": "any"})));
+        let _ = convert_tool_choice(Some(json!({"type": "weird"})));
+        let _ = convert_tool_choice(Some(json!(42)));
+    }
+
+
 }

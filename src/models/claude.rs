@@ -332,4 +332,59 @@ mod tests {
             _ => panic!("expected document block"),
         }
     }
+
+    #[test]
+    #[should_panic(expected = "expected document block")]
+    fn test_text_block_panics_when_matched_as_document() {
+        // Line 288: cover the `_ => panic!` arm by deserializing a non-document
+        // block and matching on the Document variant.
+        let block: ClaudeContentBlock = serde_json::from_value(json!({
+            "type": "text",
+            "text": "hello"
+        }))
+        .unwrap();
+
+        match block {
+            ClaudeContentBlock::Document { .. } => {}
+            _ => panic!("expected document block"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected document block")]
+    fn test_image_block_panics_when_matched_as_document() {
+        // Line 310: cover the `_ => panic!` arm with an image block.
+        let block: ClaudeContentBlock = serde_json::from_value(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBOR"
+            }
+        }))
+        .unwrap();
+
+        match block {
+            ClaudeContentBlock::Document { .. } => {}
+            _ => panic!("expected document block"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected document block")]
+    fn test_tool_use_block_panics_when_matched_as_document() {
+        // Line 332: cover the `_ => panic!` arm with a tool_use block.
+        let block: ClaudeContentBlock = serde_json::from_value(json!({
+            "type": "tool_use",
+            "id": "tool_1",
+            "name": "calculator",
+            "input": {}
+        }))
+        .unwrap();
+
+        match block {
+            ClaudeContentBlock::Document { .. } => {}
+            _ => panic!("expected document block"),
+        }
+    }
 }

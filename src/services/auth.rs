@@ -13,12 +13,17 @@ pub fn normalize_auth_value_to_key(value: &str) -> String {
         if trimmed.len() == 6 {
             return String::new();
         }
-        // "Bearer " or "Bearer <token>" — extract the token part after "Bearer "
+        // "Bearer " or "Bearer <token>" — extract the token part after "Bearer ".
+        // Note: `key` is always non-empty here. `value.trim()` (line 6) already
+        // stripped all trailing whitespace, so `trimmed` cannot end in
+        // whitespace — meaning `trimmed[7..].trim()` is non-empty whenever we
+        // reach this branch (the 7th byte is a space and there is non-space
+        // content after it, otherwise the outer trim would have removed the
+        // space and shortened `trimmed` to 6 bytes, hitting the `len == 6`
+        // branch above). The former `if key.is_empty()` guard was therefore
+        // dead code and has been removed.
         if trimmed.as_bytes()[6] == b' ' {
             let key = trimmed[7..].trim();
-            if key.is_empty() {
-                return String::new();
-            }
             return key.to_string();
         }
     }
@@ -272,5 +277,27 @@ mod tests {
 
         let result = extract_client_key(&headers);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_normalize_auth_bearer_prefix_without_space_passes_through() {
+        // "Bearer" prefix (case-insensitive) with no space at byte 6 falls
+        // through to returning the trimmed value unchanged.
+        let result = normalize_auth_value_to_key("BearerXYZ");
+        assert_eq!(result, "BearerXYZ");
+    }
+
+    #[test]
+    fn test_normalize_auth_lowercase_bearer_no_space_passes_through() {
+        let result = normalize_auth_value_to_key("bearerfoo");
+        assert_eq!(result, "bearerfoo");
+    }
+
+    #[test]
+    fn test_extract_client_key_passes_through_non_bearer_auth() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("ApiKey abc123"));
+        let result = extract_client_key(&headers);
+        assert_eq!(result, Some("ApiKey abc123".to_string()));
     }
 }

@@ -87,19 +87,15 @@ impl SseEventParser {
 
     /// Flush at end-of-stream (if the server doesn't send a final blank line).
     pub fn flush(mut self) -> Option<String> {
-        // If there is data in buf that doesn't end in newline, we should try to process it
+        // If there is data in buf that doesn't end in newline, we should try to process it.
+        // `push_and_drain_events` drains every complete line (up to and including each
+        // `\n`), so by the time `flush` runs `self.buf` never ends in `\n`. The former
+        // trailing-`\n`/`\r` trim was therefore dead code and has been removed; the
+        // remaining bytes are treated as one final (possibly partial) line.
         if !self.buf.is_empty() {
             // Process remaining buffer as one last line
             let line_bytes = std::mem::take(&mut self.buf);
-            let mut len = line_bytes.len();
-            // Trim logic (though unlikely to have trailing \n here due to loop condition)
-            if len > 0 && line_bytes[len - 1] == b'\n' {
-                len -= 1;
-                if len > 0 && line_bytes[len - 1] == b'\r' {
-                    len -= 1;
-                }
-            }
-            let trimmed = &line_bytes[..len];
+            let trimmed = &line_bytes[..];
 
             if trimmed.starts_with(b"data:") {
                 let data_content = &trimmed[5..];
@@ -402,5 +398,94 @@ mod tests {
 
         assert_eq!(events2.len(), 1);
         assert_eq!(events2[0], "price: €");
+    }
+
+    #[test]
+    fn test_sse_parser_blank_line_without_data() {
+        // Line 57: blank line when cur_data_lines is empty (no event emitted)
+        let mut parser = SseEventParser::new();
+        let events = parser.push_and_drain_events(b"\n\n");
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn test_sse_parser_event_line_ignored() {
+        // Non-data: lines (e.g., event: lines) should be ignored
+        let mut parser = SseEventParser::new();
+        let events = parser.push_and_drain_events(b"event: ping\ndata: hello\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], "hello");
+    }
+
+    #[test]
+    fn test_sse_parser_id_line_ignored() {
+        let mut parser = SseEventParser::new();
+        let events = parser.push_and_drain_events(b"id: 42\ndata: test\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], "test");
+    }
+
+    #[test]
+    fn test_sse_parser_multiple_data_lines_joined() {
+        let mut parser = SseEventParser::new();
+        let events = parser.push_and_drain_events(b"data: line1\ndata: line2\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], "line1\nline2");
+    }
+
+    #[test]
+    fn test_sse_parser_flush_trailing_newline() {
+        // Line 97-100: flush with trailing \n in buffer
+        let mut parser = SseEventParser::new();
+        let _ = parser.push_and_drain_events(b"data: test\n");
+        let flushed = parser.flush();
+        assert_eq!(flushed, Some("test".to_string()));
+    }
+
+    #[test]
+    fn test_sse_parser_flush_non_data_line() {
+        // Line 110: flush with buffer content that is NOT a data: line
+        let mut parser = SseEventParser::new();
+        let _ = parser.push_and_drain_events(b"event: ping\n");
+        let flushed = parser.flush();
+        assert_eq!(flushed, None);
+    }
+
+    #[test]
+    fn test_sse_parser_flush_carriage_return() {
+        // Flush with \r\n ending
+        let mut parser = SseEventParser::new();
+        let _ = parser.push_and_drain_events(b"data: hello\r\n");
+        let flushed = parser.flush();
+        assert_eq!(flushed, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_sse_parser_comment_line_ignored() {
+        // Lines starting with ':' are comments in SSE
+        let mut parser = SseEventParser::new();
+        let events = parser.push_and_drain_events(b": comment\ndata: real\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], "real");
+    }
+
+    #[test]
+    fn test_sse_parser_buffer_overflow_logs_when_logging_enabled() {
+        // The warn! format arguments on overflow are only evaluated when a
+        // logger is registered. Install the test logger so they execute.
+        crate::test_log::init_test_logger();
+        let mut parser = SseEventParser::new();
+        let huge = vec![b'x'; MAX_BUFFER_SIZE + 1000];
+        let events = parser.push_and_drain_events(&huge);
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn test_sse_parser_flush_non_data_line_is_dropped() {
+        let mut parser = SseEventParser::new();
+        // remaining buffer that is not a data: line → dropped by flush
+        let _ = parser.push_and_drain_events(b"event: only\n");
+        let flushed = parser.flush();
+        assert_eq!(flushed, None);
     }
 }

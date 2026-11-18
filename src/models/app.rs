@@ -219,4 +219,66 @@ mod tests {
         assert_eq!(breaker.consecutive_failures, 0);
         assert!(breaker.last_failure_time.is_none());
     }
+    #[test]
+    fn test_circuit_breaker_record_failure_disabled_still_increments() {
+        // Even when disabled, record_failure increments failures and can set is_open
+        // at threshold. This is the battle test issue 2.1: the breaker records
+        // failures regardless of enabled state, but should_allow_request short-
+        // circuits to true when disabled, and health_check reports healthy.
+        let mut breaker = CircuitBreakerState::new(false);
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            breaker.record_failure();
+        }
+        assert_eq!(breaker.consecutive_failures, CIRCUIT_BREAKER_FAILURE_THRESHOLD);
+        assert!(breaker.is_open); // is_open set even when disabled
+        assert!(!breaker.enabled);
+    }
+
+    #[test]
+    fn test_circuit_breaker_disabled_open_still_allows_request() {
+        let mut breaker = CircuitBreakerState::new(false);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        breaker.last_failure_time = Some(SystemTime::now());
+        // Even with is_open=true, disabled breaker allows all requests
+        assert!(breaker.should_allow_request());
+    }
+
+    #[test]
+    fn test_circuit_breaker_record_success_on_disabled_breaker() {
+        let mut breaker = CircuitBreakerState::new(false);
+        breaker.consecutive_failures = 10;
+        breaker.is_open = true;
+        breaker.last_failure_time = Some(SystemTime::now());
+        breaker.record_success();
+        assert_eq!(breaker.consecutive_failures, 0);
+        assert!(!breaker.is_open);
+        assert!(breaker.last_failure_time.is_none());
+    }
+
+    #[test]
+    fn test_circuit_breaker_record_failure_logs_warning_at_threshold() {
+        // The warn! format argument (self.consecutive_failures) is only
+        // evaluated when logging is enabled. Install the test logger so the
+        // argument line is executed and counted.
+        crate::test_log::init_test_logger();
+        let mut breaker = CircuitBreakerState::new(true);
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            breaker.record_failure();
+        }
+        assert!(breaker.is_open);
+    }
+
+    #[test]
+    fn test_circuit_breaker_half_open_logs_info_on_recovery() {
+        // The info! log on half-open recovery is only evaluated when logging
+        // is enabled.
+        crate::test_log::init_test_logger();
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        breaker.last_failure_time = Some(SystemTime::now() - Duration::from_secs(31));
+        assert!(breaker.should_allow_request());
+        assert!(!breaker.is_open);
+    }
 }

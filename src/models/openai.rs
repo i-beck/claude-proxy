@@ -11,7 +11,7 @@ pub struct OAIMessage {
     pub tool_calls: Option<Vec<Value>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 pub struct OAIFunction {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,7 +19,7 @@ pub struct OAIFunction {
     pub parameters: Value,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 pub struct OAITool {
     #[serde(rename = "type")]
     pub type_: String,
