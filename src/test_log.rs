@@ -51,5 +51,12 @@ mod tests {
         init_test_logger();
         init_test_logger(); // second call is a no-op via Once
         log::logger().flush();
+        // Verify set_max_level(Trace) ran. We check the runtime max level
+        // (set inside the Once) rather than `log_enabled!`, because
+        // `log_enabled!` additionally consults the installed logger's
+        // `enabled()` hook and the static max-level feature, making it a
+        // fragile signal; the Once-guaranteed runtime level is the reliable
+        // proof that init_test_logger() executed.
+        assert_eq!(log::max_level(), log::LevelFilter::Trace);
     }
 }
