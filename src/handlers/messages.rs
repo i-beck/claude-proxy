@@ -2501,6 +2501,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_messages_streaming_flush_fatal_error_without_final_blank_line() {
+        // Lines 1950-1951: a backend that sends a valid chunk then a trailing
+        // error chunk WITHOUT a final blank line (and no [DONE]) forces the
+        // flush() path to process the error chunk, returning FatalError. The
+        // `fatal_error = true` branch (line 1951) is taken, so the circuit
+        // breaker success is NOT recorded.
+        crate::test_log::init_test_logger();
+        let first = json!({
+            "id": "chatcmpl-flush-err",
+            "object": "chat.completion.chunk",
+            "model": "zai-org/GLM-4.5-Air",
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+        });
+        let trailing_error = json!({
+            "error": { "message": "flushed trailing error", "type": "server_error" }
+        });
+        // No final blank line after the second data: → flush() picks it up.
+        let body = format!("data: {first}\n\ndata: {trailing_error}");
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+        // The flushed error chunk produces error text in the SSE stream.
+        assert!(b.contains("flushed trailing error") || b.contains("Backend Error"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_flush_client_disconnected_without_final_blank_line() {
+        // Line 1953: a backend that sends a valid chunk then a trailing error
+        // chunk WITHOUT a final blank line (no [DONE]). The client drops the
+        // response early, so when flush() processes the error chunk,
+        // emit_backend_error_text fails (receiver gone) → ClientDisconnected.
+        crate::test_log::init_test_logger();
+        use tokio::io::AsyncWriteExt;
+        let first = format!(
+            "data: {}\n\ndata: {}",
+            json!({
+                "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air",
+                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+            }),
+            json!({ "error": { "message": "trailing flushed error", "type": "server_error" } })
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+                .await;
+            let _ = sock.write_all(format!("{:X}\r\n", first.len()).as_bytes()).await;
+            let _ = sock.write_all(first.as_bytes()).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.flush().await;
+            // Hold the connection open so the task has time to process + flush,
+            // then close cleanly after a delay.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        let app = test_app(format!("http://{addr}/v1/chat/completions"), false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        // Drop the response without consuming → receiver dropped → flush's
+        // error emission fails → ClientDisconnected (line 1953).
+        drop(response);
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_client_disconnected_during_error_in_loop() {
+        // Lines 1929-1930: a backend that sends an error chunk with a final
+        // blank line (so it is processed in the main loop, not the flush
+        // path). The client drops the response, so emit_backend_error_text
+        // fails → process_backend_sse_payload returns ClientDisconnected →
+        // the loop sets done=true and breaks (lines 1929-1930).
+        crate::test_log::init_test_logger();
+        use tokio::io::AsyncWriteExt;
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air",
+                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+            }),
+            json!({ "error": { "message": "loop error", "type": "server_error" } })
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+                .await;
+            let _ = sock.write_all(format!("{:X}\r\n", body.len()).as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        let app = test_app(format!("http://{addr}/v1/chat/completions"), false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        // Drop the response so the receiver is gone when the error chunk is
+        // processed in the loop → ClientDisconnected (lines 1929-1930).
+        drop(response);
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    }
+
+    #[tokio::test]
     async fn test_messages_streaming_flushes_trailing_reasoning_without_final_blank_line() {
         let body = format!(
             "data: {}\n\ndata: {}",
@@ -2638,6 +2776,52 @@ mod tests {
         assert_eq!(parsed["role"], "assistant");
         assert_eq!(parsed["content"][0]["type"], "thinking");
         assert_eq!(parsed["content"][1]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_empty_reasoning_content_skips_thinking_block() {
+        // Line 1768: a non-streaming backend response with reasoning_content set
+        // to an empty string must NOT produce a thinking block (the
+        // `if !reasoning.is_empty()` false branch). The response should contain
+        // only a text block, no thinking block.
+        let body = json!({
+            "id": "chatcmpl-empty-reasoning",
+            "object": "chat.completion",
+            "model": "deepseek-r1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "",
+                    "content": "visible answer"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
+        }).to_string();
+        let backend_url = spawn_static_backend(
+            StatusCode::OK,
+            "application/json",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "deepseek-r1",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (_, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        // No thinking block should be present — only a text block.
+        assert_eq!(parsed["content"][0]["type"], "text");
+        assert_eq!(parsed["content"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
