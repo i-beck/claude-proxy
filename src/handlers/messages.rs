@@ -2327,9 +2327,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
         let models_url = format!("http://{addr}/v1/models");
         let client = reqwest::Client::new();
@@ -2420,9 +2418,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
         let models_url = format!("http://{addr}/v1/models");
         let client = reqwest::Client::new();
@@ -2474,9 +2470,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
         format!("http://{addr}/v1/chat/completions")
     }
@@ -3729,10 +3723,8 @@ mod tests {
     fn test_parse_claude_content_blocks_non_array_value() {
         let blocks = parse_claude_content_blocks(&json!("just a string"), "user");
         assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            ClaudeContentBlock::Text { text, .. } => assert!(text.contains("Unsupported Claude content block: text")),
-            _ => panic!("expected text block"),
-        }
+        let ClaudeContentBlock::Text { text, .. } = &blocks[0] else { panic!("expected text block") };
+        assert!(text.contains("Unsupported Claude content block: text"));
     }
     #[test]
     fn test_parse_claude_content_blocks_number() {
@@ -3752,12 +3744,8 @@ mod tests {
             "assistant",
         );
         assert_eq!(blocks.len(), 1);
-        match &blocks[0] {
-            ClaudeContentBlock::Text { text, .. } => {
-                assert!(text.contains("Unsupported Claude content block: unknown_type"));
-            }
-            _ => panic!("expected text fallback block"),
-        }
+        let ClaudeContentBlock::Text { text, .. } = &blocks[0] else { panic!("expected text fallback block") };
+        assert!(text.contains("Unsupported Claude content block: unknown_type"));
     }
 
     // ========================================================================
@@ -5830,9 +5818,7 @@ mod tests {
                 }),
             )
             .route("/v1/models", get(|| async { Json(json!({ "data": [] })) }));
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
+        tokio::spawn(async move { let _ = axum::serve(listener, router).await; });
         let models_url = format!("http://{addr}/v1/models");
         let client = reqwest::Client::new();
         for _ in 0..20 {
@@ -6501,9 +6487,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
         let backend_url = format!("http://{addr}/v1/chat/completions");
         let client = reqwest::Client::new();
         for _ in 0..20 {
@@ -6568,7 +6552,7 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
         let client = reqwest::Client::new();
         for _ in 0..20 {
             if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
@@ -6641,7 +6625,7 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
         let client = reqwest::Client::new();
         for _ in 0..20 {
             if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
@@ -6685,7 +6669,7 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
         let client = reqwest::Client::new();
         for _ in 0..20 {
             if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
@@ -6700,6 +6684,45 @@ mod tests {
         let cb = make_circuit_breaker();
         run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    // ========================================================================
+    // Non-object JSON chunks (line 773): valid JSON that is not an object
+    // (array, number, string) fails OAIStreamChunk deserialization, succeeds
+    // as Value, has no error field, and is_object() is false, falling through
+    // the if-let-Ok(value) block to the JSON-parse-failed path.
+    // ========================================================================
+    #[tokio::test]
+    async fn test_process_sse_payload_non_object_json_array() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let result = process_backend_sse_payload(&tx, &mut state, "[1,2,3]").await;
+        assert!(matches!(result, StreamPayloadOutcome::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_process_sse_payload_non_object_json_number() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let result = process_backend_sse_payload(&tx, &mut state, "42").await;
+        assert!(matches!(result, StreamPayloadOutcome::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_recv_n_then_drop_breaks_when_sender_dropped_early() {
+        // Line 6353: when the sender is dropped before n events arrive,
+        // rx.recv() returns None, hitting the break.
+        let (tx, handle) = recv_n_then_drop(5).await;
+        drop(tx); // sender dropped → rx.recv() returns None → break
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 
 }
