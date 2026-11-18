@@ -47,16 +47,13 @@ impl SseEventParser {
             // Take the line including the newline
             let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
 
-            // Trim newline and possible carriage return
+            // Trim newline and possible carriage return.
+            // line_bytes is drained up to and including the \n, so it always
+            // ends with b'\n'; the trim is unconditional.
             let mut len = line_bytes.len();
-            // coverage: condition always true — line_bytes is drained up to and
-            // including the \n, so it always ends with b'\n'; the false branch
-            // (and the closing brace below) is unreachable in practice.
-            if len > 0 && line_bytes[len - 1] == b'\n' {
+            len -= 1; // strip the \n
+            if len > 0 && line_bytes[len - 1] == b'\r' {
                 len -= 1;
-                if len > 0 && line_bytes[len - 1] == b'\r' {
-                    len -= 1;
-                }
             }
 
             let trimmed = &line_bytes[..len];

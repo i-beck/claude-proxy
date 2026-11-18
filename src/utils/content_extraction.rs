@@ -35,11 +35,10 @@ pub fn count_input_tokens(
             if let Some(desc) = &tool.description {
                 text_parts.push(desc.clone());
             }
-            // coverage: serde_json::to_string(&tool.input_schema) always succeeds for a
-            // valid serde_json::Value, so the `if let Ok` false branch is unreachable.
-            if let Ok(schema_str) = serde_json::to_string(&tool.input_schema) {
-                text_parts.push(schema_str);
-            }
+            // serde_json::to_string on a Value never fails; unwrap_or_default avoids
+            // an unreachable `if let Ok` false branch.
+            let schema_str = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+            text_parts.push(schema_str);
         }
     }
 
@@ -121,11 +120,9 @@ pub fn extract_text_from_content(content: &Value) -> (String, usize) {
                             texts.push(name.to_string());
                         }
                         if let Some(input) = obj.get("input") {
-                            // coverage: serde_json::to_string(input) always succeeds for a
-                            // valid Value, so the `if let Ok` false branch below is unreachable.
-                            if let Ok(input_str) = serde_json::to_string(input) {
-                                texts.push(input_str);
-                            }
+                            // serde_json::to_string on a Value never fails.
+                            let input_str = serde_json::to_string(input).unwrap_or_default();
+                            texts.push(input_str);
                         }
                     }
                     _ => {}

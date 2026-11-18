@@ -201,8 +201,7 @@ mod tests {
             "BACKEND_HOST_HEADER" => Some("llm.chutes.ai".into()),
             "BACKEND_TIMEOUT_SECS" => Some("45".into()),
             "ENABLE_CIRCUIT_BREAKER" => Some("true".into()),
-            "HOST_PORT" => Some("9090".into()),
-            _ => None,
+            "HOST_PORT" => Some("9090".into()), _ => None,
         });
 
         assert_eq!(

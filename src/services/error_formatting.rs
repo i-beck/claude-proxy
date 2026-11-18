@@ -106,15 +106,14 @@ pub fn build_model_list_content(
         let mut result = String::new();
         let half = models.len().div_ceil(2);
         for i in 0..half {
-            // coverage: models.get(i) is always Some because i < half = div_ceil(len/2)
-            // <= len; the None branch (and the closing brace below) is unreachable.
-            if let Some(&left_model) = models.get(i) {
-                let left_price = crate::constants::get_price_tier(
-                    left_model.input_price_usd,
-                    left_model.output_price_usd,
-                );
-                let left_formatted = format!("{:4} {}", left_price, left_model.id);
-                if let Some(&right_model) = models.get(i + half) {
+            // i < half = div_ceil(len/2) <= len, so models[i] is always valid.
+            let &left_model = &models[i];
+            let left_price = crate::constants::get_price_tier(
+                left_model.input_price_usd,
+                left_model.output_price_usd,
+            );
+            let left_formatted = format!("{:4} {}", left_price, left_model.id);
+            if let Some(&right_model) = models.get(i + half) {
                     let right_price = crate::constants::get_price_tier(
                         right_model.input_price_usd,
                         right_model.output_price_usd,
@@ -124,7 +123,6 @@ pub fn build_model_list_content(
                 } else {
                     result.push_str(&format!("  {}\n", left_formatted));
                 }
-            }
         }
         result
     };

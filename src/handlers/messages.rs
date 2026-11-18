@@ -6344,8 +6344,10 @@ mod tests {
     }
 
     // Receiver that consumes exactly n events then drops, so the (n+1)th send fails.
+    // Uses capacity 0 so every send blocks until the receiver actively takes it —
+    // this makes the (n+1)th send deterministically fail (no race with buffering).
     async fn recv_n_then_drop(n: usize) -> (tokio::sync::mpsc::Sender<Event>, tokio::task::JoinHandle<()>) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(0);
         let handle = tokio::spawn(async move {
             let mut rx = rx;
             for _ in 0..n {
