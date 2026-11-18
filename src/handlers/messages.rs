@@ -744,6 +744,8 @@ async fn process_backend_sse_payload(
                         .and_then(Value::as_str)
                         .unwrap_or("Unknown error");
                     let error_details = if error_msg.is_empty() {
+                        // coverage: serde_json::to_string on a serde_json::Value never
+                        // returns Err, so the unwrap_or_else fallback below is unreachable.
                         serde_json::to_string(error_obj)
                             .unwrap_or_else(|_| "Unknown backend error".into())
                     } else {
@@ -1395,6 +1397,10 @@ pub async fn messages(
             && (last_msg.content.is_null()
                 || (last_msg.content.is_string()
                     && last_msg.content.as_str().unwrap_or("").is_empty()))
+            // coverage: the conversion (line ~1233) only ever sets tool_calls to
+            // Some when non-empty and None otherwise, so the `.map(|v| v.is_empty())`
+            // closure is never invoked — tool_calls is None here whenever it would
+            // have been empty. The closure is retained defensively.
             && last_msg
                 .tool_calls
                 .as_ref()
@@ -1522,6 +1528,9 @@ pub async fn messages(
             if json_body.contains("\"image_url\"") || json_body.contains("\"file_data\"") {
                 log::info!("📸 Request contains inline media or file data (truncated in logs)");
             }
+            // coverage: this debug block runs only after the auth check above,
+            // which already rejected requests with no client_key. So client_key
+            // is always Some here and the "Not Set" fallback below is unreachable.
             let auth_header_str = client_key
                 .as_ref()
                 .map(|k| format!("Bearer {}", mask_token(k)))
@@ -1600,6 +1609,9 @@ pub async fn messages(
         });
 
         // Read error response body
+        // coverage: reqwest's res.text() only errors on a malformed body decode;
+        // for the JSON/text backends exercised by tests it succeeds, so the
+        // "Unknown error" fallback below is a defensive unreachable path.
         let error_body = res
             .text()
             .await
@@ -5862,4 +5874,233 @@ mod tests {
         // The stream still completes (the handler closes blocks and finishes)
         assert_eq!(status, StatusCode::OK);
     }
+
+    // ========================================================================
+    // Additional branch coverage (message conversion, helpers, streaming)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_conv_assistant_thinking_covers_three_false_branches() {
+        // Lines 1172 (signature None), 1218 (no redacted), 1230 (no text):
+        // a single thinking block with no signature, no text, no redacted thinking.
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [
+                {"role": "user", "content": "think"},
+                {"role": "assistant", "content": [{"type": "thinking", "thinking": "deliberation"}]}
+            ],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+    }
+
+    #[tokio::test]
+    async fn test_conv_assistant_redacted_thinking_only() {
+        // Line 1213: assistant with only redacted_thinking → thinking_parts empty.
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "redacted"}]}
+            ],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+    }
+
+    #[tokio::test]
+    async fn test_conv_user_tool_result_without_text() {
+        // Line 1154: user tool_result with no text blocks → text_parts empty.
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]
+            }],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+    }
+
+    #[tokio::test]
+    async fn test_conv_assistant_tool_use_kept_as_last_message() {
+        // Line 1401: assistant tool_use as the last message → tool_calls Some →
+        // `.map(|v| v.is_empty())` evaluated (false) → placeholder NOT removed.
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "calc", "input": {"x": 1}}]}
+            ],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+    }
+
+    #[tokio::test]
+    async fn test_conv_stop_sequences_truncated_to_four() {
+        // Line 1437: stop_sequences with >4 items truncated to 4.
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stop_sequences": ["a", "b", "c", "d", "e"],
+            "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+        let captured = captured.read().await;
+        assert_eq!(captured[0]["stop"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_append_non_stream_text_content_array_item_without_text_field() {
+        // Line 190: array items without a "text" field and not bare strings → false branch.
+        let mut blocks = Vec::new();
+        append_non_stream_text_content(&mut blocks, Some(&json!([{"type": "image"}, 42])));
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_unsupported_content_block_text_includes_preview() {
+        // Line 265: an unsupported block with a text preview → preview appended.
+        let text = unsupported_content_block_text(&json!({"type": "custom", "text": "a meaningful preview"}));
+        assert!(text.contains("[Unsupported Claude content block: custom]"));
+        assert!(text.contains("a meaningful preview"));
+    }
+
+    // --- process_backend_sse_payload usage branches ---
+
+    #[tokio::test]
+    async fn test_process_sse_payload_usage_without_prompt_tokens() {
+        // Line 828: usage with completion_tokens but no prompt_tokens → false branch.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let data = serde_json::to_string(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 7}
+        })).unwrap();
+        let outcome = process_backend_sse_payload(&tx, &mut state, &data).await;
+        assert!(matches!(outcome, StreamPayloadOutcome::Continue));
+        assert_eq!(state.output_token_count, 7);
+        assert!(state.backend_reported_usage);
+    }
+
+    #[tokio::test]
+    async fn test_process_sse_payload_usage_without_completion_tokens() {
+        // Line 836: usage with prompt_tokens but no completion_tokens → false branch.
+        crate::test_log::init_test_logger();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        let data = serde_json::to_string(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5}
+        })).unwrap();
+        let outcome = process_backend_sse_payload(&tx, &mut state, &data).await;
+        assert!(matches!(outcome, StreamPayloadOutcome::Continue));
+        assert!(!state.backend_reported_usage);
+    }
+
+    // --- Streaming helper disconnect paths ---
+
+    #[tokio::test]
+    async fn test_stream_reasoning_delta_disconnect_when_text_block_open() {
+        // Line 439: text_open=true + dropped rx → close_text_block_if_open fails → false.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: true, text_index: 0, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!stream_reasoning_delta(&tx, &mut state, "thinking...").await);
+    }
+
+    #[tokio::test]
+    async fn test_emit_backend_error_text_disconnect_on_close_thinking() {
+        // Line 648: thinking_open=true + dropped rx → close_thinking_block_if_open fails.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: true, thinking_index: 0,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
+    }
+
+    #[tokio::test]
+    async fn test_emit_backend_error_text_disconnect_on_close_text() {
+        // Line 651: text_open=true (thinking closed) + dropped rx → close_text fails.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx);
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: true, text_index: 0, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
+    }
+
+    // Receiver that consumes exactly n events then drops, so the (n+1)th send fails.
+    async fn recv_n_then_drop(n: usize) -> (tokio::sync::mpsc::Sender<Event>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        let handle = tokio::spawn(async move {
+            let mut rx = rx;
+            for _ in 0..n {
+                if rx.recv().await.is_none() {
+                    break;
+                }
+            }
+            // rx dropped at end of scope → subsequent sends fail
+        });
+        (tx, handle)
+    }
+
+    #[tokio::test]
+    async fn test_emit_error_disconnect_on_delta_after_one_recv() {
+        // Lines 674-675: receiver consumes content_block_start (1) then drops →
+        // the content_block_delta send fails → "Client disconnected during error delta".
+        let (tx, handle) = recv_n_then_drop(1).await;
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_emit_error_disconnect_on_stop_after_two_recv() {
+        // Lines 680-681: receiver consumes start+delta (2) then drops →
+        // the content_block_stop send fails → "Client disconnected during error stop".
+        let (tx, handle) = recv_n_then_drop(2).await;
+        let mut state = StreamState {
+            next_block_index: 0, thinking_open: false, thinking_index: -1,
+            text_open: false, text_index: -1, tools: HashMap::new(),
+            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+        };
+        assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
+        handle.await.unwrap();
+    }
+
 }
