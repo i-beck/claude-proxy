@@ -699,6 +699,8 @@ async fn process_choice_message(
     let mut content_blocks = Vec::new();
     append_non_stream_text_content(&mut content_blocks, message.get("content"));
     for block in content_blocks {
+        // coverage: append_non_stream_text_content only pushes {"type":"text","text":..}
+        // blocks, so `block.get("text")` is always Some; the None branch below is unreachable.
         if let Some(text) = block.get("text").and_then(Value::as_str) {
             if !stream_text_delta(tx, state, text).await {
                 return false;
@@ -1412,6 +1414,9 @@ pub async fn messages(
             let _ = msgs.pop();
             log::debug!("📊 After filtering: {} messages remaining", msgs.len());
         }
+        // coverage: msgs is never empty here — cr.messages is validated non-empty and each
+        // message yields >=1 OAI message, so `if let Some(last_msg) = msgs.last()` is always
+        // Some; the None branch (this closing brace) is unreachable.
     }
 
     if msgs.is_empty() {
@@ -6101,6 +6106,35 @@ mod tests {
         };
         assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
         handle.await.unwrap();
+    }
+
+
+    #[test]
+    fn test_unsupported_content_block_text_empty_preview_skips_append() {
+        // Line 265: an unsupported block whose text preview compacts to empty
+        // (whitespace-only) → `if !preview.is_empty()` is false.
+        let text = unsupported_content_block_text(&json!({"type": "custom", "text": "   "}));
+        assert!(text.contains("[Unsupported Claude content block: custom]"));
+        assert!(!text.contains("   "));
+    }
+
+    #[tokio::test]
+    async fn test_conv_stop_sequences_within_limit_not_truncated() {
+        // Line 1443: stop_sequences with <=4 items → `if s.len() > 4` is false
+        // (the not-truncated branch).
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stop_sequences": ["only", "two"],
+            "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+        let captured = captured.read().await;
+        assert_eq!(captured[0]["stop"].as_array().unwrap().len(), 2);
     }
 
 }
