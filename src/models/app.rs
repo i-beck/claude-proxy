@@ -186,6 +186,18 @@ mod tests {
     }
 
     #[test]
+    fn test_circuit_breaker_blocks_when_failure_time_in_future() {
+        // Line 80: enabled, open, last_failure_time in the future → duration_since
+        // returns Err → the `if let Ok(elapsed)` false branch is taken → falls to false.
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        breaker.last_failure_time = Some(SystemTime::now() + Duration::from_secs(60));
+
+        assert!(!breaker.should_allow_request());
+    }
+
+    #[test]
     fn test_circuit_breaker_record_failure_increments_and_sets_time() {
         let mut breaker = CircuitBreakerState::new(true);
         assert!(breaker.last_failure_time.is_none());

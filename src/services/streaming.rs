@@ -291,6 +291,18 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_parser_flush_ignores_non_data_remainder() {
+        // Line 106: flush() with remaining bytes that don't start with "data:"
+        // (e.g. a trailing "event:" line) → the `if trimmed.starts_with(b"data:")`
+        // false branch is taken and nothing is appended to cur_data_lines.
+        let mut parser = SseEventParser::new();
+        // Push a non-data line with no newline so it stays in the buffer until flush.
+        let _ = parser.push_and_drain_events(b"event: ping");
+        let flushed = parser.flush();
+        assert_eq!(flushed, None);
+    }
+
+    #[test]
     fn test_sse_parser_flush_empty() {
         let parser = SseEventParser::new();
 

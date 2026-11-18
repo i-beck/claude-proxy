@@ -35,6 +35,8 @@ pub fn count_input_tokens(
             if let Some(desc) = &tool.description {
                 text_parts.push(desc.clone());
             }
+            // coverage: serde_json::to_string(&tool.input_schema) always succeeds for a
+            // valid serde_json::Value, so the `if let Ok` false branch is unreachable.
             if let Ok(schema_str) = serde_json::to_string(&tool.input_schema) {
                 text_parts.push(schema_str);
             }
@@ -51,12 +53,18 @@ pub fn count_input_tokens(
         }
         // coverage: unreachable — tiktoken_rs::cl100k_base() always returns Ok in practice;
         // the Err branch is a defensive fallback that never triggers
-        Err(_) => {
-            let text_estimate = std::cmp::max(1, combined_text.len() / CHARS_PER_TOKEN);
-            let image_tokens = image_count * TOKENS_PER_IMAGE;
-            (text_estimate + image_tokens) as u32
-        }
+        Err(_) => estimate_tokens_fallback(&combined_text, image_count),
     }
+}
+
+/// Estimate token count from text length and image count when tiktoken
+/// is unavailable. Uses character-based approximation (4 chars ≈ 1 token).
+/// Extracted from count_input_tokens so the fallback logic is independently
+/// testable even though the Err branch of cl100k_base() never triggers.
+fn estimate_tokens_fallback(combined_text: &str, image_count: usize) -> u32 {
+    let text_estimate = std::cmp::max(1, combined_text.len() / CHARS_PER_TOKEN);
+    let image_tokens = image_count * TOKENS_PER_IMAGE;
+    (text_estimate + image_tokens) as u32
 }
 
 /// Extract text content from Claude content value (string or array of blocks)
@@ -432,6 +440,80 @@ mod tests {
         let content = json!([]);
         let (text, images) = extract_text_from_content(&content);
         assert_eq!(text, "");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_block_missing_text_field() {
+        // Line 78: text block without a "text" field → `if let Some(text)` is false.
+        let content = json!([{"type": "text"}]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_block_text_not_string() {
+        // Line 78: text block where "text" is not a string → `if let Some(text)` is false.
+        let content = json!([{"type": "text", "text": 42}]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_tool_result_array_item_missing_text_field() {
+        // Line 102: tool_result content array item typed "text" but without a "text" field.
+        let content = json!([
+            {"type": "tool_result", "content": [
+                {"type": "text"},
+                {"type": "text", "text": "visible"}
+            ]}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "visible");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_tool_result_no_content_field() {
+        // Line 109: tool_result block without a "content" field → `if let Some` is false.
+        let content = json!([
+            {"type": "tool_result", "tool_use_id": "tool_1"}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_tool_use_no_name() {
+        // Line 114: tool_use block without a "name" field → `if let Some(name)` is false.
+        let content = json!([
+            {"type": "tool_use", "input": {"a": 1}}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert!(text.contains("\"a\":1") || text.contains("\"a\": 1"));
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_tool_use_no_input() {
+        // Lines 118-119: tool_use block without an "input" field → `if let Some(input)` is false.
+        let content = json!([
+            {"type": "tool_use", "name": "calculator"}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "calculator");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_array_with_bare_string() {
+        // Line 125: array containing a bare string element (not an object) → `else if let Some(s)`.
+        let content = json!(["a bare string", {"type": "text", "text": "block"}]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "a bare string\nblock");
         assert_eq!(images, 0);
     }
 
@@ -1326,5 +1408,48 @@ mod tests {
         assert!(text.contains("calc"));
     }
 
+    // ========================================================================
+    // estimate_tokens_fallback — character-based estimation used when
+    // tiktoken_rs::cl100k_base() fails (defensive fallback). Extracted
+    // into a separate function so the fallback logic is independently
+    // testable even though the Err branch never triggers in practice.
+    // ========================================================================
 
+    #[test]
+    fn test_estimate_tokens_fallback_empty_text_returns_minimum_one() {
+        // Empty text → max(1, 0) = 1 text token, 0 image tokens → 1 total
+        assert_eq!(estimate_tokens_fallback("", 0), 1);
+    }
+
+    #[test]
+    fn test_estimate_tokens_fallback_short_text_returns_at_least_one() {
+        // 3 chars → 3/4 = 0 → max(1, 0) = 1 text token
+        assert_eq!(estimate_tokens_fallback("abc", 0), 1);
+    }
+
+    #[test]
+    fn test_estimate_tokens_fallback_long_text_estimates_by_char_ratio() {
+        // 40 chars → 40/4 = 10 text tokens
+        let text = "a".repeat(40);
+        assert_eq!(estimate_tokens_fallback(&text, 0), 10);
+    }
+
+    #[test]
+    fn test_estimate_tokens_fallback_adds_image_tokens() {
+        // 40 chars → 10 text tokens + 2 images * 85 = 170 → 180 total
+        let text = "a".repeat(40);
+        assert_eq!(
+            estimate_tokens_fallback(&text, 2),
+            10 + 2 * TOKENS_PER_IMAGE as u32
+        );
+    }
+
+    #[test]
+    fn test_estimate_tokens_fallback_only_images() {
+        // Empty text → 1 text token + 3 images * 85 = 255 → 256 total
+        assert_eq!(
+            estimate_tokens_fallback("", 3),
+            1 + 3 * TOKENS_PER_IMAGE as u32
+        );
+    }
 }
