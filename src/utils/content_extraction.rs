@@ -1185,4 +1185,56 @@ mod tests {
     }
 
 
+    #[test]
+    fn test_convert_system_object() {
+        // System is an object (not string, not array) — should clone
+        let system = json!({"key": "value"});
+        let result = convert_system_content(&system);
+        assert_eq!(result, json!({"key": "value"}));
+    }
+
+    #[test]
+    fn test_convert_system_number() {
+        let system = json!(42);
+        let result = convert_system_content(&system);
+        assert_eq!(result, json!(42));
+    }
+
+    #[test]
+    fn test_convert_system_bool() {
+        let system = json!(true);
+        let result = convert_system_content(&system);
+        assert_eq!(result, json!(true));
+    }
+
+    #[test]
+    fn test_serialize_tool_result_null() {
+        let content = json!(null);
+        let result = serialize_tool_result_content(&content);
+        assert_eq!(result, "null");
+    }
+
+    #[test]
+    fn test_serialize_tool_result_number() {
+        let content = json!(42);
+        let result = serialize_tool_result_content(&content);
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_serialize_tool_result_bool() {
+        let content = json!(true);
+        let result = serialize_tool_result_content(&content);
+        assert_eq!(result, "true");
+    }
+
+    #[test]
+    fn test_serialize_tool_result_array_empty_object() {
+        let content = json!([{}]);
+        let result = serialize_tool_result_content(&content);
+        // Non-text object without type field → JSON-serialized
+        assert!(result.contains("{}"));
+    }
+
+
 }

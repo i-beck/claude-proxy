@@ -39,3 +39,18 @@ pub fn init_test_logger() {
         log::set_max_level(log::LevelFilter::Trace);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_init_logger_and_flush() {
+        // Exercises init_test_logger (idempotent) and the NoopLogger::flush
+        // path (required by the Log trait but otherwise never called).
+        init_test_logger();
+        init_test_logger(); // second call is a no-op via Once
+        log::logger().flush();
+        assert!(log::log_enabled!(log::Level::Trace));
+    }
+}

@@ -387,4 +387,100 @@ mod tests {
             _ => panic!("expected document block"),
         }
     }
+    #[test]
+    fn test_thinking_config_enabled_with_custom_budget() {
+        let config: ThinkingConfig = serde_json::from_value(json!({
+            "type": "enabled",
+            "budget_tokens": 5000
+        })).unwrap();
+        assert_eq!(
+            config.into_backend_config(),
+            Some(BackendThinkingConfig {
+                type_: "enabled".into(),
+                budget_tokens: 5000,
+            })
+        );
+    }
+
+    #[test]
+    fn test_thinking_config_disabled_returns_none() {
+        let config: ThinkingConfig = serde_json::from_value(json!({
+            "type": "disabled"
+        })).unwrap();
+        assert_eq!(config.into_backend_config(), None);
+    }
+
+    #[test]
+    fn test_claude_request_with_all_optional_fields() {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        })).unwrap();
+        assert!(request.max_tokens.is_none());
+        assert!(request.temperature.is_none());
+        assert!(request.top_p.is_none());
+        assert!(request.top_k.is_none());
+        assert!(request.stop_sequences.is_none());
+        assert!(request.tools.is_none());
+        assert!(request.tool_choice.is_none());
+        assert!(request.thinking.is_none());
+        assert!(request.output_config.is_none());
+        assert!(request.metadata.is_none());
+        assert!(request.service_tier.is_none());
+        assert!(request.system.is_none());
+    }
+
+    #[test]
+    fn test_claude_request_with_camel_case_output_config() {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effortLevel": "high"}
+        })).unwrap();
+        assert_eq!(
+            request.output_config.as_ref().and_then(|c| c.effort.as_deref()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn test_claude_output_config_default() {
+        let config = ClaudeOutputConfig::default();
+        assert!(config.effort.is_none());
+    }
+
+    #[test]
+    fn test_claude_token_count_request_minimal() {
+        let request: ClaudeTokenCountRequest = serde_json::from_value(json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}]
+        })).unwrap();
+        assert_eq!(request.model, "test");
+        assert_eq!(request.messages.len(), 1);
+        assert!(request.system.is_none());
+        assert!(request.tools.is_none());
+    }
+
+    #[test]
+    fn test_claude_tool_with_description() {
+        let tool: ClaudeTool = serde_json::from_value(json!({
+            "name": "test_tool",
+            "description": "A test tool",
+            "input_schema": {"type": "object"}
+        })).unwrap();
+        assert_eq!(tool.name, "test_tool");
+        assert_eq!(tool.description.as_deref(), Some("A test tool"));
+    }
+
+    #[test]
+    fn test_claude_tool_without_description() {
+        let tool: ClaudeTool = serde_json::from_value(json!({
+            "name": "test_tool",
+            "input_schema": {"type": "object"}
+        })).unwrap();
+        assert_eq!(tool.name, "test_tool");
+        assert!(tool.description.is_none());
+    }
+
+
 }

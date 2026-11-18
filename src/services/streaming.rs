@@ -488,4 +488,39 @@ mod tests {
         let flushed = parser.flush();
         assert_eq!(flushed, None);
     }
+    #[test]
+    fn test_sse_parser_buffer_limit_then_valid_data() {
+        let mut parser = SseEventParser::new();
+        // First, exceed the buffer limit with garbage (no newline)
+        let huge = vec![b'x'; MAX_BUFFER_SIZE + 100];
+        let events1 = parser.push_and_drain_events(&huge);
+        assert_eq!(events1.len(), 0);
+        // Now send valid SSE data — should work after buffer reset
+        let events2 = parser.push_and_drain_events(b"data: hello\n\n");
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0], "hello");
+    }
+
+    #[test]
+    fn test_sse_parser_multiple_data_lines_no_blank() {
+        let mut parser = SseEventParser::new();
+        // Multiple data: lines without blank line — should accumulate
+        let events1 = parser.push_and_drain_events(b"data: line1\ndata: line2\n");
+        assert_eq!(events1.len(), 0);
+        // Now blank line → emit combined
+        let events2 = parser.push_and_drain_events(b"\n");
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0], "line1\nline2");
+    }
+
+    #[test]
+    fn test_sse_parser_data_line_then_non_data_line() {
+        let mut parser = SseEventParser::new();
+        // data: line followed by event: line then blank
+        let events = parser.push_and_drain_events(b"data: payload\nevent: test\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], "payload");
+    }
+
+
 }
