@@ -1,8 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 ### Thanks to Z.AI for creating this script! Original version, which uses z.ai, here: https://cdn.bigmodel.cn/install/claude_code_zai_env.sh
 
 set -euo pipefail
+
+# This script relies on bash 4+ features (arrays, C-style for loops). macOS ships
+# bash 3.2 via /bin/bash, so require a modern bash (e.g. Homebrew's) and fail early
+# with a helpful message instead of silently misbehaving.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "[ERR ] This script requires bash. Please install bash 4+ (e.g. 'brew install bash')." >&2
+    exit 1
+fi
+
+_major="${BASH_VERSION%%.*}"
+if [ "$_major" -lt 4 ]; then
+    echo "[ERR ] This script requires bash 4 or newer (found ${BASH_VERSION})." >&2
+    echo "       On macOS, install it with 'brew install bash' and re-run with that bash." >&2
+    exit 1
+fi
 
 # ========================
 #       Define Constants
@@ -16,16 +31,30 @@ CONFIG_DIR="$HOME/.claude"
 CONFIG_FILE="$CONFIG_DIR/settings.json"
 BACKEND_BASE_URL="https://llm.chutes.ai"
 API_KEY_URL="https://chutes.ai/app/api"
-API_TIMEOUT_MS=6000000
+# 10 minutes. Long enough for long agentic runs; the previous 100-minute value was
+# almost certainly a typo (an extra zero). Override with API_TIMEOUT_MS if needed.
+API_TIMEOUT_MS=600000
 HOSTED_PROXY_BASE_URL="https://claude.chutes.ai"
 E2EE_PROXY_HOST="https://e2ee-local-proxy.chutes.dev"
 E2EE_IMAGE="parachutes/e2ee-proxy:latest"
 E2EE_CONTAINER_NAME="chutes-e2ee-local-proxy"
 DEFAULT_E2EE_PORT=8443
-DEFAULT_MODEL="zai-org/GLM-4.7-TEE"
+# Default model. GLM-4.7-TEE no longer exists on the Chutes API; use a current TEE
+# reasoning model. Override with CLAUDE_MODEL or pick interactively.
+DEFAULT_MODEL="zai-org/GLM-5.1-TEE"
 PROXY_BASE_URL="$HOSTED_PROXY_BASE_URL"
 USE_E2EE_PROXY="${USE_E2EE_PROXY:-}"
 E2EE_SELECTED_PORT=""
+# Opt-in only: when set to 1/true/yes, the installer disables Claude Code's permission
+# gates (bypassPermissions, skipDangerousModePermissionPrompt, autoAllowBashIfSandboxed).
+# Off by default so new users keep Claude Code's normal permission prompts.
+CLAUDE_DANGEROUS_MODE="${CLAUDE_DANGEROUS_MODE:-}"
+# Pinned SHA-256 checksums for the remote installers we download and run. Override via
+# the matching env var when the upstream script changes (e.g. a new nvm release).
+NVM_INSTALL_URL="https://raw.githubusercontent.com/nvm-sh/nvm/${NVM_VERSION}/install.sh"
+NVM_INSTALL_SHA256="2d8359a64a3cb07c02389ad88ceecd43f2fa469c06104f92f98df5b6f315275f"
+DOCKER_INSTALL_URL="https://get.docker.com"
+DOCKER_INSTALL_SHA256="c9e2607b313b7a208027fa225b9d0454e72c9ff4cd0e2c5f7a9edd8eb6a890e4"
 
 # ========================
 #       Functions
@@ -51,6 +80,46 @@ ensure_dir_exists() {
             exit 1
         }
     fi
+}
+
+# Download a remote script to a temp file and verify its SHA-256 before running it.
+# Usage: download_and_verify <url> <expected_sha256> <output_file>
+download_and_verify() {
+    local url="$1"
+    local expected="$2"
+    local output="$3"
+    local actual=""
+
+    if [ -z "$expected" ]; then
+        log_error "Refusing to download and run $url without a pinned SHA-256 checksum."
+        return 1
+    fi
+
+    if ! curl -fsSL "$url" -o "$output"; then
+        log_error "Failed to download $url"
+        return 1
+    fi
+
+    if command -v sha256sum &>/dev/null; then
+        actual=$(sha256sum "$output" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        actual=$(shasum -a 256 "$output" | awk '{print $1}')
+    elif command -v openssl &>/dev/null; then
+        actual=$(openssl dgst -sha256 "$output" | awk '{print $NF}')
+    else
+        log_error "No SHA-256 tool (sha256sum/shasum/openssl) found to verify $url"
+        return 1
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        log_error "Checksum mismatch for $url"
+        log_error "  expected: $expected"
+        log_error "  actual:   $actual"
+        rm -f "$output"
+        return 1
+    fi
+
+    return 0
 }
 
 mask_api_key() {
@@ -158,7 +227,15 @@ ensure_docker_installed() {
         log_success "Docker is already installed: $(docker --version)"
     else
         log_info "Docker not found. Installing..."
-        curl -fsSL https://get.docker.com | sudo sh
+        local docker_install_script
+        docker_install_script=$(mktemp)
+        if ! download_and_verify "$DOCKER_INSTALL_URL" "$DOCKER_INSTALL_SHA256" "$docker_install_script"; then
+            rm -f "$docker_install_script"
+            log_error "Docker installation aborted: could not verify the installer checksum"
+            exit 1
+        fi
+        sudo sh "$docker_install_script"
+        rm -f "$docker_install_script"
         command -v docker &>/dev/null || {
             log_error "Docker installation failed"
             exit 1
@@ -295,7 +372,9 @@ configure_proxy_mode() {
         USE_E2EE_PROXY="1"
         ensure_docker_installed
         ensure_e2ee_proxy_running
-        PROXY_BASE_URL="${E2EE_PROXY_HOST}:${E2EE_SELECTED_PORT}"
+        # The e2ee-proxy container listens on 127.0.0.1:<local port> (TLS on 443),
+        # not on the remote E2EE_PROXY_HOST. Point Claude Code at the local port.
+        PROXY_BASE_URL="https://127.0.0.1:${E2EE_SELECTED_PORT}"
         log_success "Using local Chutes e2ee-proxy at $PROXY_BASE_URL"
     else
         USE_E2EE_PROXY="0"
@@ -308,6 +387,49 @@ configure_proxy_mode() {
 #     Node.js Installation
 # ========================
 
+# Append the nvm init snippet to the user's shell rc file(s) so that node/npm/claude
+# remain on PATH in new shells after this installer exits. Idempotent: adds the marker
+# block at most once per file. Skips files that already contain it.
+persist_nvm_in_shell_rc() {
+    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+    local marker='# >>> chutes claude-code env: nvm init (added by install_claude_code.sh) >>>'
+    local endmarker='# <<< chutes claude-code env: nvm init <<<'
+    local snippet
+    snippet=$(cat <<EOF
+${marker}
+export NVM_DIR="${nvm_dir}"
+[ -s "\$NVM_DIR/nvm.sh" ] && \\. "\$NVM_DIR/nvm.sh"
+[ -s "\$NVM_DIR/bash_completion" ] && \\. "\$NVM_DIR/bash_completion"
+${endmarker}
+EOF
+)
+
+    local rc_files=()
+    # On macOS the default shell is zsh; also cover bash for Linux/older setups.
+    [ -f "$HOME/.zshrc" ] && rc_files+=("$HOME/.zshrc")
+    [ -f "$HOME/.bashrc" ] && rc_files+=("$HOME/.bashrc")
+    # If neither exists yet, create ~/.zshrc on macOS and ~/.bashrc elsewhere so the
+    # snippet has somewhere to live.
+    if [ "${#rc_files[@]}" -eq 0 ]; then
+        if [ "$(uname -s)" = "Darwin" ]; then
+            : >"$HOME/.zshrc"
+            rc_files+=("$HOME/.zshrc")
+        else
+            : >"$HOME/.bashrc"
+            rc_files+=("$HOME/.bashrc")
+        fi
+    fi
+
+    local rc
+    for rc in "${rc_files[@]}"; do
+        if grep -qF "$marker" "$rc" 2>/dev/null; then
+            continue
+        fi
+        printf '\n%s\n' "$snippet" >> "$rc"
+        log_success "Added nvm init to $rc"
+    done
+}
+
 install_nodejs() {
     local platform=$(uname -s)
 
@@ -315,9 +437,17 @@ install_nodejs() {
         Linux|Darwin)
             log_info "Installing Node.js on $platform..."
 
-            # Install nvm
+            # Install nvm (download, verify checksum, then run)
             log_info "Installing nvm ($NVM_VERSION)..."
-            curl -s https://raw.githubusercontent.com/nvm-sh/nvm/"$NVM_VERSION"/install.sh | bash
+            local nvm_install_script
+            nvm_install_script=$(mktemp)
+            if ! download_and_verify "$NVM_INSTALL_URL" "$NVM_INSTALL_SHA256" "$nvm_install_script"; then
+                rm -f "$nvm_install_script"
+                log_error "nvm installation aborted: could not verify the installer checksum"
+                exit 1
+            fi
+            bash "$nvm_install_script"
+            rm -f "$nvm_install_script"
 
             # Load nvm
             log_info "Loading nvm environment..."
@@ -334,6 +464,10 @@ install_nodejs() {
             }
             log_success "Node.js installed: $(node -v)"
             log_success "npm version: $(npm -v)"
+
+            # Persist nvm in the user's shell rc so node/npm/claude remain on PATH
+            # after this script exits. Idempotent: only adds the snippet once.
+            persist_nvm_in_shell_rc
             ;;
         *)
             log_error "Unsupported platform: $platform"
@@ -371,7 +505,9 @@ check_nodejs() {
 install_claude_code() {
     if command -v claude &>/dev/null; then
         log_success "Claude Code is already installed: $(claude --version). Updating..."
-        claude update
+        # `claude update` may not exist on older installs; fall back to npm so a
+        # missing subcommand does not abort the script under `set -e`.
+        claude update 2>/dev/null || npm update -g "$CLAUDE_PACKAGE"
     else
         log_info "Installing Claude Code..."
         npm install -g "$CLAUDE_PACKAGE" || {
@@ -730,6 +866,13 @@ configure_claude() {
     ensure_dir_exists "$CONFIG_DIR"
 
     # Write settings.json
+    # Pass sensitive values via process.env instead of string interpolation so a
+    # value containing a single quote cannot break the generated JS or inject code.
+    CHUTES_API_KEY="$api_key" \
+    CHUTES_MODEL="$selected_model" \
+    CHUTES_PROXY_BASE_URL="$PROXY_BASE_URL" \
+    CHUTES_API_TIMEOUT_MS="$API_TIMEOUT_MS" \
+    CLAUDE_DANGEROUS_MODE="$CLAUDE_DANGEROUS_MODE" \
     node --eval '
       const os = require("os");
       const fs = require("fs");
@@ -737,10 +880,13 @@ configure_claude() {
 
       const homeDir = os.homedir();
       const filePath = path.join(homeDir, ".claude", "settings.json");
-      const apiKey = "'"$api_key"'";
-      const selectedModel = "'"$selected_model"'";
-      const proxyBaseUrl = "'"$PROXY_BASE_URL"'";
-      const apiTimeout = "'"$API_TIMEOUT_MS"'";
+      const apiKey = process.env.CHUTES_API_KEY;
+      const selectedModel = process.env.CHUTES_MODEL;
+      const proxyBaseUrl = process.env.CHUTES_PROXY_BASE_URL;
+      const apiTimeout = process.env.CHUTES_API_TIMEOUT_MS;
+      const dangerous = ["1", "true", "yes"].includes(
+          (process.env.CLAUDE_DANGEROUS_MODE || "").toLowerCase()
+      );
 
       const asObject = (value) =>
           value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -771,16 +917,18 @@ configure_claude() {
           alwaysThinkingEnabled: true,
           promptSuggestionEnabled: false,
           effortLevel: "low",
-          skipDangerousModePermissionPrompt: true,
+          // Only set when the user explicitly opts in via CLAUDE_DANGEROUS_MODE=1.
+          // By default Claude Code keeps its normal permission prompts.
+          ...(dangerous ? { skipDangerousModePermissionPrompt: true } : {}),
           env,
           permissions: {
               ...asObject(content.permissions),
-              defaultMode: "bypassPermissions"
+              ...(dangerous ? { defaultMode: "bypassPermissions" } : {})
           },
           sandbox: {
               ...asObject(content.sandbox),
               enabled: true,
-              autoAllowBashIfSandboxed: true
+              ...(dangerous ? { autoAllowBashIfSandboxed: true } : {})
           }
       }, null, 2), "utf-8");
     ' || {
