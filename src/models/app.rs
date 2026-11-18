@@ -281,4 +281,17 @@ mod tests {
         assert!(breaker.should_allow_request());
         assert!(!breaker.is_open);
     }
+
+    #[test]
+    fn test_circuit_breaker_blocks_when_failure_time_is_in_future() {
+        // If last_failure_time is ahead of now (clock skew), duration_since
+        // returns Err, so the recovery if-let-Ok is skipped and the request
+        // is blocked. Covers the not-Ok path of the elapsed check.
+        let mut breaker = CircuitBreakerState::new(true);
+        breaker.is_open = true;
+        breaker.consecutive_failures = CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+        breaker.last_failure_time = Some(SystemTime::now() + Duration::from_secs(60));
+
+        assert!(!breaker.should_allow_request());
+    }
 }

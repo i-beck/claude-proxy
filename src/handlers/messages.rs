@@ -5262,4 +5262,150 @@ mod tests {
 
 
 
+    // ========================================================================
+    // Log-enabled tests — cover log::warn!, log::debug!, log::info! calls
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_logging_enabled_covers_log_calls_in_validation() {
+        // Install a logger that enables all levels — this is global, so
+        // all subsequent tests also benefit from it.
+        crate::test_log::init_test_logger();
+
+        // Exercise validation paths with log::warn! calls
+        let app = test_app(spawn_mock_backend().await, false);
+
+        // Too many messages — log::warn! at validation
+        let msgs: Vec<Value> = (0..100_001).map(|_| json!({"role": "user", "content": "x"})).collect();
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": msgs,
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app.clone()), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(response).await;
+
+        // Content too large — log::warn!
+        let big_content = "x".repeat(5 * 1024 * 1024 + 1);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": big_content}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app.clone()), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(response).await;
+
+        // Invalid max_tokens — log::warn!
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0,
+            "stream": false
+        }));
+        let response = messages(State(app.clone()), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(response).await;
+
+        // System prompt too large — log::warn!
+        let big_system = "x".repeat(100 * 1024 + 1);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": big_system,
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(response).await;
+    }
+
+    #[tokio::test]
+    async fn test_logging_enabled_covers_streaming_log_calls() {
+        // Logger already installed by the test above (or by this test's try_init)
+        crate::test_log::init_test_logger();
+
+        // Exercise streaming path with log::debug! and log::info! calls
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "deepseek-r1",
+            "messages": [{"role": "user", "content": "think about this"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, body) = response_text(response).await;
+        assert_eq!(status, StatusCode::OK);
+        // Verify the streaming completed
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_logging_enabled_covers_error_paths() {
+        crate::test_log::init_test_logger();
+
+        // Exercise non-streaming error path with log::error! calls
+        let app = test_app(unused_backend_url().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(response).await;
+
+        // Streaming connection failure
+        let app = test_app(unused_backend_url().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let _ = messages(State(app), auth_headers(), axum::Json(request)).await;
+    }
+
+    #[tokio::test]
+    async fn test_logging_enabled_covers_backend_error_in_stream() {
+        crate::test_log::init_test_logger();
+
+        // Exercise error in SSE stream path
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"error": {"message": "stream error", "type": "test"}})
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body,
+            StatusCode::OK, json!({"data": []}),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(response).await;
+    }
+
+    #[tokio::test]
+    async fn test_logging_enabled_covers_non_streaming_success_path() {
+        crate::test_log::init_test_logger();
+
+        // Exercise non-streaming success path with log::info! calls
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "deepseek-r1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(response).await;
+    }
+
+
+
 }

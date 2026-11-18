@@ -1288,5 +1288,43 @@ mod tests {
         assert!(result.contains("{}"));
     }
 
+    #[test]
+    fn test_extract_text_text_block_missing_text_field() {
+        // A "text" block whose "text" field is absent → the if-let-Some is
+        // None, exercising the not-entered path (line 78).
+        let content = json!([{"type": "text"}, {"type": "text", "text": "ok"}]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "ok");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_text_block_non_string_text_field() {
+        // "text" field present but not a string → as_str() None → not entered.
+        let content = json!([{"type": "text", "text": 123}, {"type": "text", "text": "yes"}]);
+        let (text, _) = extract_text_from_content(&content);
+        assert_eq!(text, "yes");
+    }
+
+    #[test]
+    fn test_extract_text_tool_use_missing_name_and_input() {
+        // tool_use block with neither "name" nor "input" → both if-let-Some
+        // paths are None (lines 114, 119). Also no "input" → to_string not
+        // reached (line 118 stays a defensive unreachable brace).
+        let content = json!([{"type": "tool_use"}, {"type": "text", "text": "after"}]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "after");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_tool_use_name_but_no_input() {
+        // tool_use with name but no "input" key → name extracted, input
+        // if-let-Some is None (line 119).
+        let content = json!([{"type": "tool_use", "name": "calc"}]);
+        let (text, _) = extract_text_from_content(&content);
+        assert!(text.contains("calc"));
+    }
+
 
 }
