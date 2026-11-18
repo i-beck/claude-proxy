@@ -3281,8 +3281,8 @@ mod tests {
     // ========================================================================
     #[test]
     fn test_extract_backend_error_message_empty_json_object() {
-        // "{}" parses but has no error/message fields → falls through to raw.trim() = "{}"
-        assert_eq!(extract_backend_error_message("{}"), "{}");
+        // "{}" parses but has no error/message fields → empty-object special case returns generic message
+        assert_eq!(extract_backend_error_message("{}"), "Unknown backend error");
     }
     #[test]
     fn test_extract_backend_error_message_error_with_type_fallback() {
