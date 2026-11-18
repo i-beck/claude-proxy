@@ -5588,19 +5588,41 @@ mod tests {
     #[tokio::test]
     async fn test_messages_streaming_drains_trailing_bytes_after_done() {
         // Lines 2012-2014: bytes arriving after [DONE] are drained so the
-        // backend connection is not cancelled mid-request.
+        // backend connection is not cancelled mid-request. We use a raw
+        // chunked-transfer server that emits the SSE payload and [DONE] in one
+        // HTTP chunk, then (after a pause) trailing bytes in a second chunk, so
+        // reqwest's bytes_stream yields >1 item and the drain loop runs.
         crate::test_log::init_test_logger();
-        let body = format!(
-            "data: {}\n\ndata: [DONE]\n\nGARBAGE_TRAILING_BYTES",
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let first = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
             json!({
                 "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air",
                 "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
             })
         );
-        let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
-        ).await;
-        let app = test_app(backend_url, false);
+        let second = "GARBAGE_TRAILING_BYTES".to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await; // consume request
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
+                .await;
+            let _ = sock.write_all(format!("{:X}\r\n", first.len()).as_bytes()).await;
+            let _ = sock.write_all(first.as_bytes()).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            let _ = sock.write_all(format!("{:X}\r\n", second.len()).as_bytes()).await;
+            let _ = sock.write_all(second.as_bytes()).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+
+        let app = test_app(format!("http://{addr}/v1/chat/completions"), false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
