@@ -964,6 +964,58 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_text_from_content_tool_result_empty_content() {
+        // tool_result with empty content field
+        let content = json!([
+            {"type": "tool_result", "content": json!(null)}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_from_content_tool_result_empty_array() {
+        // tool_result with empty array content
+        let content = json!([
+            {"type": "tool_result", "content": []}
+        ]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
+    fn test_extract_text_from_content_tool_use_without_name() {
+        // tool_use block with missing name field
+        let content = json!([
+            {"type": "tool_use", "input": {"a": 1}}
+        ]);
+        let (text, _) = extract_text_from_content(&content);
+        // name is missing, so only input is extracted
+        assert!(text.contains("\"a\""));
+    }
+
+    #[test]
+    fn test_extract_text_from_content_tool_use_without_input() {
+        // tool_use block with missing input field
+        let content = json!([
+            {"type": "tool_use", "name": "my_tool"}
+        ]);
+        let (text, _) = extract_text_from_content(&content);
+        assert!(text.contains("my_tool"));
+    }
+
+    #[test]
+    fn test_extract_text_from_content_block_as_string_in_array() {
+        // Array with plain string items (not objects)
+        let content = json!(["just a string", "another"]);
+        let (text, images) = extract_text_from_content(&content);
+        assert_eq!(text, "just a string\nanother");
+        assert_eq!(images, 0);
+    }
+
+    #[test]
     fn test_serialize_tool_result_content_number() {
         // Line 238: non-string, non-array value → serde_json::to_string fallback
         let content = json!(42);
