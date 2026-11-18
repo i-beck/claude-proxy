@@ -6834,4 +6834,29 @@ mod tests {
         assert!(body.contains(r#""prompt_tokens":2"#));
     }
 
+    // ========================================================================
+    // Empty assistant placeholder removal (line 1632): a request whose last
+    // message is an assistant with empty content triggers the
+    // `last_is_empty_assistant` filter — the message is popped and a debug
+    // log is emitted.
+    // ========================================================================
+    #[tokio::test]
+    async fn test_messages_empty_assistant_last_message_is_filtered_and_logged() {
+        crate::test_log::init_test_logger();
+        let (backend_url, _captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": ""}
+            ],
+            "max_tokens": 32,
+            "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, _body) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
 }

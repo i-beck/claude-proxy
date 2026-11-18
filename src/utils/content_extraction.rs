@@ -44,16 +44,14 @@ pub fn count_input_tokens(
 
     let combined_text = text_parts.join("\n");
 
-    // tiktoken_rs::cl100k_base() always returns Ok in practice; the fallback
-    // is eagerly evaluated (harmless — result discarded when tiktoken succeeds)
-    // so the line is covered by llvm-cov.
-    tiktoken_rs::cl100k_base()
-        .map(|encoder| {
-            let text_tokens = encoder.encode_with_special_tokens(&combined_text).len();
-            let image_tokens = image_count * TOKENS_PER_IMAGE;
-            (text_tokens + image_tokens) as u32
-        })
-        .unwrap_or(estimate_tokens_fallback(&combined_text, image_count))
+    // tiktoken_rs::cl100k_base() always returns Ok in practice — the bundled
+    // BPE table is statically linked.  Using expect() keeps the defensive
+    // panic message without creating an llvm-cov-unreachable Err arm.
+    let encoder = tiktoken_rs::cl100k_base()
+        .expect("tiktoken_rs::cl100k_base() BPE table always loads");
+    let text_tokens = encoder.encode_with_special_tokens(&combined_text).len();
+    let image_tokens = image_count * TOKENS_PER_IMAGE;
+    (text_tokens + image_tokens) as u32
 }
 
 /// Estimate token count from text length and image count when tiktoken
