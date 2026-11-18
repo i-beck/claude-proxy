@@ -5614,12 +5614,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_error_chunk_with_type_only() {
-        // Lines 743/748 and 793: a backend chunk carrying an error object with
-        // a "type" but no "message" exercises the type-fallback path.
+        // Lines 743/748: a chunk that is valid JSON with an error object (with
+        // "type" but no "message") but FAILS OAIStreamChunk deserialization
+        // (choices is a string, not an array) falls into the JSON-fallback
+        // branch and exercises the type-fallback path.
         crate::test_log::init_test_logger();
         let body = format!(
             "data: {}\n\ndata: [DONE]\n\n",
-            json!({ "error": { "type": "some_error_type" } })
+            json!({ "error": { "type": "some_error_type" }, "choices": "not-an-array" })
         );
         let backend_url = spawn_static_backend(
             StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
@@ -5638,13 +5640,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_object_chunk_without_choices() {
-        // Lines 772/776: a backend chunk that is a JSON object but has no
-        // "choices" array is skipped with a logged warning.
+        // Lines 772/776: a chunk that fails OAIStreamChunk deserialization
+        // (choices is a string) but is a valid JSON object is skipped via the
+        // JSON-fallback "is_object" branch.
         crate::test_log::init_test_logger();
         let body = format!(
             "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-            json!({ "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air", "choices": [] }),
-            json!({ "id": "x", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air", "usage": { "prompt_tokens": 1 } })
+            json!({ "id": "x", "choices": "not-an-array" }),
+            json!({ "id": "y", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air", "usage": { "prompt_tokens": 1 }, "choices": "bad" })
         );
         let backend_url = spawn_static_backend(
             StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
