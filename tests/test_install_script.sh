@@ -165,11 +165,18 @@ _wrong_sha="0000000000000000000000000000000000000000000000000000000000000000"
 # that runs this test ($BASH), so the install script's bash-4+ version
 # guard passes. Using plain `bash` would resolve to /bin/bash (3.2) on
 # macOS and the guard would reject it, silently skipping the function.
+# If $BASH is bash 3.2 (test run with the default shell), fall back to
+# Homebrew bash 4+ which is required by the install script.
+_dav_bash="$BASH"
+_dav_major="${BASH_VERSION%%.*}"
+if [ "${_dav_major:-0}" -lt 4 ] 2>/dev/null; then
+    _dav_bash="/opt/homebrew/bin/bash"
+fi
 _dav_runner() {
     # $1 = expected result token, $2.. = args to download_and_verify
     local _expected_token="$1"; shift
     local _out
-    _out=$("$BASH" -c '
+    _out=$("$_dav_bash" -c '
         set -euo pipefail
         source "$1" 2>/dev/null || true
         _tmpdl=$(mktemp)

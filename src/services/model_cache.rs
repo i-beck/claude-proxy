@@ -129,9 +129,7 @@ mod tests {
             }),
         );
 
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
         format!("http://{addr}/v1/chat/completions")
     }
@@ -255,9 +253,7 @@ mod tests {
                 }
             }),
         );
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
 
         let mut app_with_host = make_app(
             format!("http://{addr}/v1/chat/completions"),

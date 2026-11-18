@@ -6655,4 +6655,51 @@ mod tests {
         run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
+
+
+    // ClientDisconnected in the flush path (line 1003): a backend that sends
+    // an error chunk WITHOUT a trailing blank line → the SSE parser buffers it,
+    // the main loop ends without done=true → flush() returns the buffered
+    // payload → process_backend_sse_payload tries to emit the error text →
+    // the send fails (receiver dropped) → ClientDisconnected.
+    #[tokio::test]
+    async fn test_streaming_flush_client_disconnected() {
+        crate::test_log::init_test_logger();
+        use axum::body::Body;
+        // Error chunk with NO trailing \n\n — stays buffered in the SSE parser.
+        let err_chunk = json!({ "error": { "message": "flush boom" } });
+        let body = format!("data: {err_chunk}");  // no trailing \n\n
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    let mut resp = Response::new(Body::from(body));
+                    resp.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/v1/models")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let res = client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap();
+        // Consume message_start + ping (2 events), then drop → the flush
+        // error-text send fails → ClientDisconnected.
+        let (tx, handle) = recv_n_then_drop(2).await;
+        let cb = make_circuit_breaker();
+        run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
 }
