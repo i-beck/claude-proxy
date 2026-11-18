@@ -5684,4 +5684,120 @@ mod tests {
         let (status, _b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_messages_streaming_error_chunk_valid_oai_with_type_only() {
+        // Line 793: a chunk that parses as OAIStreamChunk but whose chunk.error
+        // has "type" but no "message" exercises the chunk.error type-fallback.
+        crate::test_log::init_test_logger();
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({ "error": { "type": "valid_error_type" }, "choices": [] })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(b.contains("valid_error_type"));
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_error_chunk_empty_message_falls_to_string() {
+        // Line 748: a JSON-fallback error chunk whose error has an empty
+        // "message" falls through to serde_json::to_string(error_obj).
+        crate::test_log::init_test_logger();
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({ "error": { "message": "", "code": 42 }, "choices": "bad" })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, _b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_large_object_chunk_preview() {
+        // Line 776: a JSON-fallback chunk larger than 500 chars is previewed
+        // with a truncation marker in the warning log.
+        crate::test_log::init_test_logger();
+        let big = "x".repeat(600);
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({ "id": "x", "choices": "bad", "payload": big })
+        );
+        let backend_url = spawn_static_backend(
+            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
+        ).await;
+        let app = test_app(backend_url, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let (status, _b) = response_text(r).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_messages_debug_log_truncates_long_inline_image() {
+        // Lines 1515-1517: with debug logging enabled and a request carrying a
+        // long inline image data URI (>120 chars), the request-body debug log
+        // truncates the data URI.
+        crate::test_log::init_test_logger();
+        let (backend_url, _captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false);
+        let long_data = "data:image/png;base64,".to_string() + &"iVBOR".repeat(60);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "look" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": long_data } }
+                ]
+            }],
+            "max_tokens": 32, "stream": false
+        }));
+        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let _ = response_text(r).await;
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_client_drops_response_before_stream() {
+        // Lines 1856/1857: if the client drops the SSE response before the
+        // streaming task can send message_start, the first send fails and the
+        // task aborts early. Dropping the response without reading the body
+        // drops the underlying receiver, so the spawned task's first tx.send
+        // returns an error.
+        crate::test_log::init_test_logger();
+        let app = test_app(spawn_mock_backend().await, false);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32, "stream": true
+        }));
+        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        // Drop the response without consuming the body → receiver dropped.
+        drop(response);
+        // Let the spawned streaming task run and hit the failed send.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
