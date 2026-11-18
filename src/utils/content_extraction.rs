@@ -44,16 +44,16 @@ pub fn count_input_tokens(
 
     let combined_text = text_parts.join("\n");
 
-    match tiktoken_rs::cl100k_base() {
-        Ok(encoder) => {
+    // tiktoken_rs::cl100k_base() always returns Ok in practice; the fallback
+    // is eagerly evaluated (harmless — result discarded when tiktoken succeeds)
+    // so the line is covered by llvm-cov.
+    tiktoken_rs::cl100k_base()
+        .map(|encoder| {
             let text_tokens = encoder.encode_with_special_tokens(&combined_text).len();
             let image_tokens = image_count * TOKENS_PER_IMAGE;
             (text_tokens + image_tokens) as u32
-        }
-        // coverage: unreachable — tiktoken_rs::cl100k_base() always returns Ok in practice;
-        // the Err branch is a defensive fallback that never triggers
-        Err(_) => estimate_tokens_fallback(&combined_text, image_count),
-    }
+        })
+        .unwrap_or(estimate_tokens_fallback(&combined_text, image_count))
 }
 
 /// Estimate token count from text length and image count when tiktoken

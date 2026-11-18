@@ -277,16 +277,12 @@ mod tests {
         }))
         .unwrap();
 
-        match block {
-            ClaudeContentBlock::Document { source, .. } => {
-                assert_eq!(source.source_type, "base64");
-                assert_eq!(source.media_type.as_deref(), Some("application/pdf"));
-                assert_eq!(source.data.as_deref(), Some("ZmFrZQ=="));
-                assert_eq!(source.url, None);
-                assert_eq!(source.file_id, None);
-            }
-            _ => panic!("expected document block"), // coverage: unreachable — deserialization always yields the Document variant; defensive arm
-        }
+        let ClaudeContentBlock::Document { source, .. } = block else { panic!("expected document block") };
+        assert_eq!(source.source_type, "base64");
+        assert_eq!(source.media_type.as_deref(), Some("application/pdf"));
+        assert_eq!(source.data.as_deref(), Some("ZmFrZQ=="));
+        assert_eq!(source.url, None);
+        assert_eq!(source.file_id, None);
     }
 
     #[test]
@@ -300,15 +296,11 @@ mod tests {
         }))
         .unwrap();
 
-        match block {
-            ClaudeContentBlock::Document { source, .. } => {
-                assert_eq!(source.source_type, "url");
-                assert_eq!(source.url.as_deref(), Some("https://example.com/file.pdf"));
-                assert_eq!(source.data, None);
-                assert_eq!(source.file_id, None);
-            }
-            _ => panic!("expected document block"), // coverage: unreachable — deserialization always yields the Document variant; defensive arm
-        }
+        let ClaudeContentBlock::Document { source, .. } = block else { panic!("expected document block") };
+        assert_eq!(source.source_type, "url");
+        assert_eq!(source.url.as_deref(), Some("https://example.com/file.pdf"));
+        assert_eq!(source.data, None);
+        assert_eq!(source.file_id, None);
     }
 
     #[test]
@@ -322,15 +314,11 @@ mod tests {
         }))
         .unwrap();
 
-        match block {
-            ClaudeContentBlock::Document { source, .. } => {
-                assert_eq!(source.source_type, "file");
-                assert_eq!(source.file_id.as_deref(), Some("file_123"));
-                assert_eq!(source.data, None);
-                assert_eq!(source.url, None);
-            }
-            _ => panic!("expected document block"), // coverage: unreachable — deserialization always yields the Document variant; defensive arm
-        }
+        let ClaudeContentBlock::Document { source, .. } = block else { panic!("expected document block") };
+        assert_eq!(source.source_type, "file");
+        assert_eq!(source.file_id.as_deref(), Some("file_123"));
+        assert_eq!(source.data, None);
+        assert_eq!(source.url, None);
     }
 
     #[test]
