@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 // Import our modules
 mod constants;
+mod e2ee;
 mod handlers;
 mod models;
 mod services;
