@@ -1,0 +1,243 @@
+//! Smoke test against the real Chutes E2E API.
+//!
+//! This test requires:
+//! - CHUTES_API_KEY environment variable
+//! - Network access to api.chutes.ai and llm.chutes.ai
+//!
+//! Run with: cargo test --bin claude_openai_proxy -- --ignored --nocapture e2e_smoke
+//!
+//! It sends a real E2E-encrypted request to a TEE model and verifies
+//! the decrypted response is valid.
+
+#![cfg(test)]
+
+use crate::e2ee::crypto;
+use crate::e2ee::discovery::Discovery;
+use crate::e2ee::handler;
+
+const API_BASE: &str = "https://api.chutes.ai";
+const LLM_MODELS_URL: &str = "https://llm.chutes.ai/v1/models";
+const TEE_MODEL_ID: &str = "zai-org/GLM-5.1-TEE";
+
+#[cfg(test)]
+mod smoke_tests {
+    use super::*;
+
+    /// Fetch the chute_id for a TEE model from the models endpoint.
+    async fn get_chute_id(api_key: &str, model_id: &str) -> Option<String> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(LLM_MODELS_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await
+            .ok()?;
+        let data: serde_json::Value = resp.json().await.ok()?;
+        data["data"]
+            .as_array()?
+            .iter()
+            .find(|m| {
+                m["id"].as_str() == Some(model_id)
+                    && m["confidential_compute"].as_bool() == Some(true)
+            })
+            .and_then(|m| m["chute_id"].as_str().map(String::from))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai"]
+    async fn e2e_smoke_test_real_tee_model() {
+        let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
+            eprintln!("CHUTES_API_KEY not set, skipping smoke test");
+            return String::new();
+        });
+        if api_key.is_empty() {
+            return;
+        }
+
+        // 1. Get chute_id for the TEE model.
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID)
+            .await
+            .expect("could not find TEE model chute_id");
+        eprintln!("TEE model {} → chute_id: {}", TEE_MODEL_ID, chute_id);
+
+        // 2. Create discovery + client.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let discovery = Discovery::new(client.clone(), API_BASE.to_string());
+
+        // 3. Build a simple OpenAI-format chat request.
+        let payload = serde_json::json!({
+            "model": TEE_MODEL_ID,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "stream": false,
+            "max_tokens": 500
+        })
+        .to_string();
+
+        // 4. Send the E2E request.
+        eprintln!("Sending E2E request to {}...", API_BASE);
+        let result = handler::e2e_request(
+            &discovery,
+            &client,
+            API_BASE,
+            &api_key,
+            &chute_id,
+            payload.as_bytes(),
+            false,
+            "/v1/chat/completions",
+        )
+        .await
+        .expect("E2E request failed");
+
+        eprintln!("Got response, status: {}", result.response.status());
+
+        // 5. Read and decrypt the response body.
+        let body = result
+            .response
+            .bytes()
+            .await
+            .expect("failed to read response body");
+        eprintln!("Encrypted response body: {} bytes", body.len());
+
+        let decrypted = handler::decrypt_non_streaming_response(&result.response_secret_key, &body)
+            .expect("failed to decrypt response");
+        eprintln!("Decrypted response: {} bytes", decrypted.len());
+
+        // 6. Parse the decrypted response as JSON.
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&decrypted).expect("decrypted response is not valid JSON");
+        eprintln!("Response: {}", serde_json::to_string_pretty(&resp_json).unwrap());
+
+        // 7. Verify the response has expected OpenAI chat completion structure.
+        assert!(
+            resp_json.get("choices").is_some(),
+            "response missing 'choices' field"
+        );
+        let choices = resp_json["choices"].as_array().expect("choices is not array");
+        assert!(!choices.is_empty(), "choices array is empty");
+        assert!(
+            choices[0].get("message").is_some(),
+            "first choice missing 'message'"
+        );
+        // The content may be in "content" or "reasoning_content" depending on
+        // whether the model finished reasoning within the token budget.
+        let content = choices[0]["message"]["content"].as_str().unwrap_or("");
+        let reasoning = choices[0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !content.is_empty() || !reasoning.is_empty(),
+            "both content and reasoning_content are empty"
+        );
+        if !content.is_empty() {
+            eprintln!("✅ Smoke test PASSED — TEE model responded: {}", content);
+        } else {
+            eprintln!(
+                "✅ Smoke test PASSED — TEE model produced reasoning: {}...",
+                &reasoning[..reasoning.len().min(80)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CHUTES_API_KEY and network access"]
+    async fn e2e_smoke_test_streaming_real_tee_model() {
+        let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
+            eprintln!("CHUTES_API_KEY not set, skipping smoke test");
+            return String::new();
+        });
+        if api_key.is_empty() {
+            return;
+        }
+
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID)
+            .await
+            .expect("could not find TEE model chute_id");
+        eprintln!("Streaming test: {} → chute_id: {}", TEE_MODEL_ID, chute_id);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let discovery = Discovery::new(client.clone(), API_BASE.to_string());
+
+        let payload = serde_json::json!({
+            "model": TEE_MODEL_ID,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "stream": true,
+            "max_tokens": 50
+        })
+        .to_string();
+
+        eprintln!("Sending streaming E2E request...");
+        let result = handler::e2e_request(
+            &discovery,
+            &client,
+            API_BASE,
+            &api_key,
+            &chute_id,
+            payload.as_bytes(),
+            true, // streaming
+            "/v1/chat/completions",
+        )
+        .await
+        .expect("E2E streaming request failed");
+
+        eprintln!("Got streaming response, status: {}", result.response.status());
+
+        // For streaming, the response is SSE with e2e_init and e2e lines.
+        // Read the full body (for simplicity in this smoke test).
+        let body = result
+            .response
+            .text()
+            .await
+            .expect("failed to read streaming response body");
+        eprintln!("Streaming response (first 500 chars): {}", &body[..body.len().min(500)]);
+
+        // Check if the body contains e2e_init or e2e markers.
+        if body.contains("e2e_init") || body.contains("e2e") {
+            eprintln!("✅ Streaming response contains E2E markers");
+            // Decrypt the stream.
+            let mut stream_key: Option<Vec<u8>> = None;
+            let mut all_text = String::new();
+            for line in body.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(e2e_init_b64) = json.get("e2e_init").and_then(|v| v.as_str()) {
+                            let e2e_init_ct =
+                                crate::e2ee::discovery::base64_decode(e2e_init_b64).unwrap();
+                            stream_key = Some(
+                                crypto::decrypt_stream_init(
+                                    &result.response_secret_key,
+                                    &e2e_init_ct,
+                                )
+                                .unwrap(),
+                            );
+                            eprintln!("Decrypted stream init, got stream key");
+                        } else if let Some(e2e_b64) = json.get("e2e").and_then(|v| v.as_str()) {
+                            let chunk =
+                                crate::e2ee::discovery::base64_decode(e2e_b64).unwrap();
+                            if let Some(ref sk) = stream_key {
+                                let plaintext =
+                                    crypto::decrypt_stream_chunk(sk, &chunk).unwrap();
+                                let text = String::from_utf8_lossy(&plaintext);
+                                all_text.push_str(&text);
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("Decrypted streaming text: {}", all_text);
+            assert!(!all_text.is_empty(), "decrypted stream text is empty");
+            eprintln!("✅ Streaming smoke test PASSED");
+        } else {
+            // Non-SSE response (some backends don't stream).
+            eprintln!("Note: response is not SSE-formatted, treating as non-streaming");
+        }
+    }
+}

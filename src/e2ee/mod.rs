@@ -3,6 +3,9 @@ pub mod discovery;
 pub mod handler;
 
 #[cfg(test)]
+mod smoke;
+
+#[cfg(test)]
 mod tests {
     use super::crypto::*;
 
