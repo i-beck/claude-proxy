@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod crypto;
 pub mod discovery;
 pub mod handler;

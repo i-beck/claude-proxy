@@ -23,6 +23,12 @@ sha2 = "0.10"
 flate2 = "1"
 base64 = "0.22"
 rand = "0.9"
+# Pure-Rust Intel DCAP/TDX quote verification (the "trusted root" of the chain).
+# default-features=false drops the reqwest/Phala-PCCS collateral fetch client —
+# we do hardware verification offline against supplied collateral + the embedded
+# Intel root CA. rustcrypto backend (no ring/assembly) keeps macOS/arm64 clean.
+dcap-qvl = { version = "0.7", default-features = false, features = ["std", "rustcrypto", "default-x509"] }
+hex = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

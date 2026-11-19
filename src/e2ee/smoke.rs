@@ -8,12 +8,29 @@
 //!
 //! It sends a real E2E-encrypted request to a TEE model and verifies
 //! the decrypted response is valid.
+//!
+//! ## Attestation status (2026-11-19 investigation)
+//!
+//! The real `api.chutes.ai/e2e/instances/{chute_id}` response returns ONLY
+//! `{instance_id, e2e_pubkey, nonces}` — NO TDX quote, NO attestation data,
+//! NO image version. All alternative attestation endpoints return 404:
+//!   /e2e/quote/{id}, /e2e/attestation/{id}, /e2e/attest/{id}, etc.
+//!
+//! Published measurements are at `/servers/tdx/measurements` (60 entries,
+//! 4 versions). The TDX quote lives on the per-VM attestation-proxy
+//! (port 8443, unreachable by the client).
+//!
+//! Consequently the smoke test runs in PERMISSIVE mode (no quote → warn +
+//! proceed). If the API starts returning quotes in the future, the
+//! attestation verification path in `e2e_request_attested` will be
+//! exercised automatically.
 
 #![cfg(test)]
 
+use crate::e2ee::attestation::AttestationMode;
 use crate::e2ee::crypto;
 use crate::e2ee::discovery::Discovery;
-use crate::e2ee::handler;
+use crate::e2ee::handler::{self, AttestationConfig};
 
 const API_BASE: &str = "https://api.chutes.ai";
 const LLM_MODELS_URL: &str = "https://llm.chutes.ai/v1/models";
@@ -76,9 +93,14 @@ mod smoke_tests {
         })
         .to_string();
 
-        // 4. Send the E2E request.
+        // 4. Send the E2E request with attestation (permissive: API returns no quote).
         eprintln!("Sending E2E request to {}...", API_BASE);
-        let result = handler::e2e_request(
+        let attest_cfg = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            override_measurements: None,
+        };
+        let result = handler::e2e_request_attested(
             &discovery,
             &client,
             API_BASE,
@@ -87,6 +109,7 @@ mod smoke_tests {
             payload.as_bytes(),
             false,
             "/v1/chat/completions",
+            &attest_cfg,
         )
         .await
         .expect("E2E request failed");
@@ -172,7 +195,12 @@ mod smoke_tests {
         .to_string();
 
         eprintln!("Sending streaming E2E request...");
-        let result = handler::e2e_request(
+        let attest_cfg = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            override_measurements: None,
+        };
+        let result = handler::e2e_request_attested(
             &discovery,
             &client,
             API_BASE,
@@ -181,6 +209,7 @@ mod smoke_tests {
             payload.as_bytes(),
             true, // streaming
             "/v1/chat/completions",
+            &attest_cfg,
         )
         .await
         .expect("E2E streaming request failed");

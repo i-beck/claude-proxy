@@ -15,6 +15,8 @@ pub struct Instance {
     pub instance_id: String,
     pub e2e_pubkey: Vec<u8>,
     pub nonces: Vec<String>,
+    /// Optional TDX quote (raw bytes) if the API returned one.
+    pub quote: Option<Vec<u8>>,
 }
 
 /// The parsed response from `GET /e2e/instances/{chute_id}`.
@@ -30,6 +32,11 @@ pub struct InstanceRaw {
     pub instance_id: String,
     pub e2e_pubkey: String,
     pub nonces: Vec<String>,
+    /// Optional TDX quote (base64-encoded raw quote bytes). The current Chutes
+    /// API does not return this field, but it is parsed when present so the
+    /// attestation verification path can be exercised.
+    #[serde(default)]
+    pub quote: Option<String>,
 }
 
 /// Cached instance pool with TTL.
@@ -62,9 +69,9 @@ impl Discovery {
         }
     }
 
-    /// Take one (instance_id, e2e_pubkey, nonce) tuple from the pool.
+    /// Take one (instance_id, e2e_pubkey, nonce, quote) tuple from the pool.
     /// If the cache is empty or expired, returns None (caller should refresh).
-    pub async fn take_nonce(&self) -> Option<(String, Vec<u8>, String)> {
+    pub async fn take_nonce(&self) -> Option<(String, Vec<u8>, String, Option<Vec<u8>>)> {
         let mut cache = self.cache.write().await;
         let cache = cache.as_mut()?;
         if cache.is_expired() {
@@ -73,7 +80,12 @@ impl Discovery {
         // Round-robin: pick the first instance with remaining nonces.
         for inst in cache.instances.iter_mut() {
             if let Some(nonce) = inst.nonces.pop() {
-                return Some((inst.instance_id.clone(), inst.e2e_pubkey.clone(), nonce));
+                return Some((
+                    inst.instance_id.clone(),
+                    inst.e2e_pubkey.clone(),
+                    nonce,
+                    inst.quote.clone(),
+                ));
             }
         }
         None
@@ -113,12 +125,13 @@ impl Discovery {
             .instances
             .into_iter()
             .map(|raw| {
-                let pubkey = base64_decode(&raw.e2e_pubkey)
-                    .unwrap_or_default();
+                let pubkey = base64_decode(&raw.e2e_pubkey).unwrap_or_default();
+                let quote = raw.quote.and_then(|q| base64_decode(&q).ok());
                 Instance {
                     instance_id: raw.instance_id,
                     e2e_pubkey: pubkey,
                     nonces: raw.nonces,
+                    quote,
                 }
             })
             .collect();
@@ -134,12 +147,12 @@ impl Discovery {
     }
 
     /// Take a nonce, refreshing if necessary. Returns the instance_id,
-    /// e2e_pubkey, and nonce.
+    /// e2e_pubkey, nonce, and optional quote.
     pub async fn acquire(
         &self,
         chute_id: &str,
         api_key: &str,
-    ) -> Result<(String, Vec<u8>, String), DiscoveryError> {
+    ) -> Result<(String, Vec<u8>, String, Option<Vec<u8>>), DiscoveryError> {
         // Try the cache first.
         if let Some(tuple) = self.take_nonce().await {
             return Ok(tuple);
@@ -232,11 +245,13 @@ mod tests {
             instance_id: "inst-1".into(),
             e2e_pubkey: pubkey.clone(),
             nonces: vec!["n1".into(), "n2".into()],
+            quote: None,
         };
         let inst2 = Instance {
             instance_id: "inst-2".into(),
             e2e_pubkey: pubkey.clone(),
             nonces: vec!["n3".into()],
+            quote: None,
         };
         let cache = InstanceCache {
             chute_id: "chute-1".into(),
@@ -250,9 +265,9 @@ mod tests {
             api_base: "http://unused".into(),
         };
         // Take 3 nonces — all should succeed.
-        let (id1, _, n1) = discovery.take_nonce().await.unwrap();
-        let (id2, _, n2) = discovery.take_nonce().await.unwrap();
-        let (id3, _, n3) = discovery.take_nonce().await.unwrap();
+        let (_id1, _, n1, _) = discovery.take_nonce().await.unwrap();
+        let (_id2, _, n2, _) = discovery.take_nonce().await.unwrap();
+        let (_id3, _, n3, _) = discovery.take_nonce().await.unwrap();
         // Nonces are consumed LIFO (pop), so inst1 yields n2, n1; inst2 yields n3.
         assert!(n1 != n2);
         assert_ne!(n3, n1);
@@ -268,6 +283,7 @@ mod tests {
             instance_id: "inst-1".into(),
             e2e_pubkey: pubkey,
             nonces: vec!["n1".into()],
+            quote: None,
         };
         let cache = InstanceCache {
             chute_id: "chute-1".into(),
@@ -293,6 +309,7 @@ mod tests {
             instance_id: "inst-1".into(),
             e2e_pubkey: pubkey,
             nonces: vec!["n1".into()],
+            quote: None,
         };
         let cache = InstanceCache {
             chute_id: "chute-1".into(),
@@ -335,7 +352,7 @@ mod tests {
             reqwest::Client::new(),
             format!("http://{}", addr),
         );
-        let (instance_id, pub_key, nonce) = discovery
+        let (instance_id, pub_key, nonce, _quote) = discovery
             .acquire("chute-x", "test-key")
             .await
             .unwrap();
@@ -343,7 +360,7 @@ mod tests {
         assert_eq!(pub_key.len(), MLKEM_EK_SIZE);
         assert!(nonce == "nonce-a" || nonce == "nonce-b");
         // Second acquire from cache.
-        let (_, _, nonce2) = discovery.acquire("chute-x", "test-key").await.unwrap();
+        let (_, _, nonce2, _) = discovery.acquire("chute-x", "test-key").await.unwrap();
         assert_ne!(nonce, nonce2);
         // Third acquire → cache exhausted → refresh → no nonces (mock returns same).
         // Actually mock returns the same nonces again, so it should succeed.
