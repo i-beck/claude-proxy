@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod discovery;
+pub mod handler;
 
 #[cfg(test)]
 mod tests {

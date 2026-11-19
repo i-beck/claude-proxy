@@ -27,6 +27,7 @@ struct RuntimeConfig {
     backend_timeout_secs: u64,
     circuit_breaker_enabled: bool,
     host_port: u16,
+    e2e_enabled: bool,
 }
 
 impl RuntimeConfig {
@@ -48,6 +49,9 @@ impl RuntimeConfig {
             host_port: get("HOST_PORT")
                 .and_then(|value| value.parse::<u16>().ok())
                 .unwrap_or(8080),
+            e2e_enabled: get("E2E_ENABLED")
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false),
         }
     }
 }
@@ -191,6 +195,7 @@ mod tests {
                 backend_timeout_secs: 600,
                 circuit_breaker_enabled: false,
                 host_port: 8080,
+                e2e_enabled: false,
             }
         );
     }
@@ -202,7 +207,9 @@ mod tests {
             "BACKEND_HOST_HEADER" => Some("llm.chutes.ai".into()),
             "BACKEND_TIMEOUT_SECS" => Some("45".into()),
             "ENABLE_CIRCUIT_BREAKER" => Some("true".into()),
-            "HOST_PORT" => Some("9090".into()), _ => None,
+            "HOST_PORT" => Some("9090".into()),
+            "E2E_ENABLED" => Some("true".into()),
+            _ => None,
         });
 
         assert_eq!(
@@ -213,6 +220,7 @@ mod tests {
                 backend_timeout_secs: 45,
                 circuit_breaker_enabled: true,
                 host_port: 9090,
+                e2e_enabled: true,
             }
         );
 
@@ -226,6 +234,7 @@ mod tests {
         assert_eq!(fallback_config.backend_timeout_secs, 600);
         assert!(!fallback_config.circuit_breaker_enabled);
         assert_eq!(fallback_config.host_port, 8080);
+        assert!(!fallback_config.e2e_enabled);
     }
 
     #[tokio::test]
@@ -236,6 +245,7 @@ mod tests {
             backend_timeout_secs: 123,
             circuit_breaker_enabled: true,
             host_port: 8080,
+            e2e_enabled: false,
         };
 
         let app = build_app(&config);
@@ -324,6 +334,7 @@ mod tests {
         std::env::remove_var("BACKEND_TIMEOUT_SECS");
         std::env::remove_var("ENABLE_CIRCUIT_BREAKER");
         std::env::remove_var("HOST_PORT");
+        std::env::remove_var("E2E_ENABLED");
 
         let config = RuntimeConfig::from_env();
         assert_eq!(
@@ -333,5 +344,6 @@ mod tests {
         assert_eq!(config.backend_timeout_secs, 600);
         assert!(!config.circuit_breaker_enabled);
         assert_eq!(config.host_port, 8080);
+        assert!(!config.e2e_enabled);
     }
 }
