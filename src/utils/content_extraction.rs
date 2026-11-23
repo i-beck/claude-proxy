@@ -1300,8 +1300,8 @@ mod tests {
 
     #[test]
     fn test_convert_tool_choice_number_value() {
-        let (result, parallel) = convert_tool_choice(Some(json!(3.14)));
-        assert_eq!(result, Some(json!(3.14)));
+        let (result, parallel) = convert_tool_choice(Some(json!(4.2)));
+        assert_eq!(result, Some(json!(4.2)));
         assert_eq!(parallel, None);
     }
 

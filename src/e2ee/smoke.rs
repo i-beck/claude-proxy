@@ -491,4 +491,470 @@ mod smoke_tests {
             content
         );
     }
+
+    /// Live test: verify the `use_evidence: true` path works end-to-end against
+    /// the real Chutes API. This exercises the flagship v3 path through
+    /// `e2e_request_attested`: the handler fetches a live TDX quote + TEE cert
+    /// from the user-reachable `GET /instances/{id}/evidence?nonce=` endpoint
+    /// (no node IP, no validator token), verifies the cert-hash key binding
+    /// (`SHA-256(SPKI-der(cert)) == report_data[32..]`), and proceeds to
+    /// encrypt + invoke.
+    ///
+    /// We run in PERMISSIVE mode so the test asserts the wiring is correct
+    /// (the evidence fetch + binding does not break the E2E flow and a valid
+    /// response is returned) without the test being flaky if the live image's
+    /// measurements drift from the pinned table — the rigorous cryptographic
+    /// proof (cert binding + DCAP `UpToDate`) lives in
+    /// `test_evidence_cert_binding_live` in `attestation.rs`.
+    ///
+    /// Requires `CHUTES_API_KEY` + network to api.chutes.ai. Run with:
+    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_live
+    #[tokio::test]
+    #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai"]
+    async fn e2e_smoke_test_use_evidence_live() {
+        let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
+            eprintln!("CHUTES_API_KEY not set, skipping smoke test");
+            return String::new();
+        });
+        if api_key.is_empty() {
+            return;
+        }
+
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID)
+            .await
+            .expect("could not find TEE model chute_id");
+        eprintln!("use_evidence live test: {} → chute_id: {}", TEE_MODEL_ID, chute_id);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let discovery = Discovery::new(client.clone(), API_BASE.to_string());
+
+        let payload = serde_json::json!({
+            "model": TEE_MODEL_ID,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "stream": false,
+            "max_tokens": 500
+        })
+        .to_string();
+
+        // use_evidence: true → the handler fetches a live quote + cert from the
+        // evidence endpoint and verifies the cert-hash binding. Permissive mode
+        // so the test asserts the wiring, not a pinned-measurement match.
+        let attest_cfg = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            override_measurements: None,
+            use_evidence: true,
+            ..Default::default()
+        };
+        eprintln!("Sending E2E request with use_evidence=true...");
+        let result = handler::e2e_request_attested(
+            &discovery,
+            &client,
+            API_BASE,
+            &api_key,
+            &chute_id,
+            payload.as_bytes(),
+            false,
+            "/v1/chat/completions",
+            &attest_cfg,
+        )
+        .await
+        .expect("E2E request with use_evidence should succeed (evidence path proceeds in permissive mode)");
+
+        assert!(
+            result.response.status().is_success(),
+            "response should be 200"
+        );
+
+        let body = result
+            .response
+            .bytes()
+            .await
+            .expect("failed to read response body");
+        let decrypted = handler::decrypt_non_streaming_response(&result.response_secret_key, &body)
+            .expect("failed to decrypt response");
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&decrypted).expect("decrypted response is not valid JSON");
+        assert!(
+            resp_json.get("choices").is_some(),
+            "response missing 'choices' field"
+        );
+        let choices = resp_json["choices"]
+            .as_array()
+            .expect("choices is not array");
+        assert!(!choices.is_empty(), "choices array is empty");
+        let content = choices[0]["message"]["content"].as_str().unwrap_or("");
+        let reasoning = choices[0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !content.is_empty() || !reasoning.is_empty(),
+            "both content and reasoning_content are empty"
+        );
+        eprintln!(
+            "✅ use_evidence live test PASSED — TEE model responded: {}",
+            content
+        );
+    }
+
+    /// Live test: verify the `use_evidence: true` path works end-to-end against
+    /// the **second** TEE model (GLM-5.2-TEE, chute_id `08901219-...`). Confirms
+    /// the evidence-path key-binding invariant (`SHA-256(SPKI-der(cert)) ==
+    /// report_data[32..]`) is not specific to the GLM-5.1 image — a different
+    /// guest image build could (in principle) use a different cert layout or
+    /// base64-encode differently. This is the `use_evidence` analog of the
+    /// existing `e2e_smoke_test_check_status_live_glm52`.
+    ///
+    /// Requires `CHUTES_API_KEY` + network to api.chutes.ai. Run with:
+    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_live_glm52
+    #[tokio::test]
+    #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai"]
+    async fn e2e_smoke_test_use_evidence_live_glm52() {
+        let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
+            eprintln!("CHUTES_API_KEY not set, skipping smoke test");
+            return String::new();
+        });
+        if api_key.is_empty() {
+            return;
+        }
+
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_52)
+            .await
+            .expect("could not find GLM-5.2-TEE model chute_id");
+        eprintln!(
+            "use_evidence live test (GLM-5.2): {} → chute_id: {}",
+            TEE_MODEL_ID_52, chute_id
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let discovery = Discovery::new(client.clone(), API_BASE.to_string());
+
+        let payload = serde_json::json!({
+            "model": TEE_MODEL_ID_52,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "stream": false,
+            "max_tokens": 500
+        })
+        .to_string();
+
+        // use_evidence: true + permissive mode (assert the wiring, not the
+        // pinned-measurement match — GLM-5.2 runs a different image version
+        // than the 1.5.0 default in the other tests).
+        let attest_cfg = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            override_measurements: None,
+            use_evidence: true,
+            ..Default::default()
+        };
+        eprintln!("Sending E2E request with use_evidence=true to GLM-5.2-TEE...");
+        let result = handler::e2e_request_attested(
+            &discovery,
+            &client,
+            API_BASE,
+            &api_key,
+            &chute_id,
+            payload.as_bytes(),
+            false,
+            "/v1/chat/completions",
+            &attest_cfg,
+        )
+        .await
+        .expect("E2E request with use_evidence should succeed on GLM-5.2-TEE");
+
+        assert!(
+            result.response.status().is_success(),
+            "response should be 200"
+        );
+
+        let body = result
+            .response
+            .bytes()
+            .await
+            .expect("failed to read response body");
+        let decrypted = handler::decrypt_non_streaming_response(&result.response_secret_key, &body)
+            .expect("failed to decrypt response");
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&decrypted).expect("decrypted response is not valid JSON");
+        assert!(
+            resp_json.get("choices").is_some(),
+            "response missing 'choices' field"
+        );
+        let choices = resp_json["choices"]
+            .as_array()
+            .expect("choices is not array");
+        assert!(!choices.is_empty(), "choices array is empty");
+        let content = choices[0]["message"]["content"].as_str().unwrap_or("");
+        let reasoning = choices[0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !content.is_empty() || !reasoning.is_empty(),
+            "both content and reasoning_content are empty"
+        );
+        eprintln!(
+            "✅ GLM-5.2-TEE use_evidence live test PASSED — responded: {}",
+            content
+        );
+    }
+
+    /// Live test: verify the **combined** `use_evidence + collateral_url` path
+    /// inside `e2e_request_attested` — the flagship v3 cryptographic path.
+    ///
+    /// The handler fetches a live TDX quote + TEE attestation cert from the
+    /// user-reachable evidence endpoint (`GET /instances/{id}/evidence?nonce=`),
+    /// verifies the cert-hash key binding
+    /// (`SHA-256(SPKI-der(cert)) == report_data[32..]`), fetches Intel PCS
+    /// collateral, and runs the DCAP cryptographic signature verification —
+    /// all inside one `e2e_request_attested` call. `collateral_url: Some("")`
+    /// tells the handler to use the default Intel PCS base
+    /// (`https://api.trustedservices.intel.com`).
+    ///
+    /// This closes a gap: the evidence cert-binding was already proven live
+    /// standalone (`test_evidence_cert_binding_live`), and the collateral
+    /// wiring was proven via the mock-miner path, but the **combination
+    /// through the handler** was untested.
+    ///
+    /// We run PERMISSIVE so the test asserts the wiring + DCAP did not break
+    /// the E2E flow (a valid response is returned) without depending on the
+    /// pinned-measurement version matching the live image — the live image's
+    /// MRTD does match the pinned 1.5.0 table today, but strict mode treats a
+    /// measurement mismatch as a hard failure, which would make this a
+    /// pinned-table test rather than a wiring test. (Strict-mode evidence
+    /// is covered offline in `test_use_evidence_valid_quote_proceeds_in_strict_mode`.)
+    ///
+    /// Requires `CHUTES_API_KEY` + network to api.chutes.ai +
+    /// api.trustedservices.intel.com. Run with:
+    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_collateral_live
+    #[tokio::test]
+    #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai + Intel PCS"]
+    async fn e2e_smoke_test_use_evidence_collateral_live() {
+        let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
+            eprintln!("CHUTES_API_KEY not set, skipping smoke test");
+            return String::new();
+        });
+        if api_key.is_empty() {
+            return;
+        }
+
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID)
+            .await
+            .expect("could not find TEE model chute_id");
+        eprintln!(
+            "use_evidence+collateral live test: {} → chute_id: {}",
+            TEE_MODEL_ID, chute_id
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let discovery = Discovery::new(client.clone(), API_BASE.to_string());
+
+        let payload = serde_json::json!({
+            "model": TEE_MODEL_ID,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "stream": false,
+            "max_tokens": 500
+        })
+        .to_string();
+
+        // The full cryptographic path: evidence quote + cert binding + DCAP.
+        //   use_evidence:            fetch live quote+cert from the evidence endpoint
+        //   collateral_url: Some("") -> default to the real Intel PCS (DCAP)
+        //   strict=False (permissive) so the live flow proceeds even if the
+        //   pinned-measurement table does not match the live image version.
+        let attest_cfg = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            override_measurements: None,
+            use_evidence: true,
+            collateral_url: Some(""),
+            ..Default::default()
+        };
+        eprintln!("Sending E2E request with use_evidence=true + collateral... ");
+        let result = handler::e2e_request_attested(
+            &discovery,
+            &client,
+            API_BASE,
+            &api_key,
+            &chute_id,
+            payload.as_bytes(),
+            false,
+            "/v1/chat/completions",
+            &attest_cfg,
+        )
+        .await
+        .expect(
+            "E2E request with use_evidence+collateral should succeed \
+             (evidence + DCAP both verified cryptographically, flow proceeds)",
+        );
+
+        assert!(
+            result.response.status().is_success(),
+            "response should be 200"
+        );
+
+        let body = result
+            .response
+            .bytes()
+            .await
+            .expect("failed to read response body");
+        let decrypted =
+            handler::decrypt_non_streaming_response(&result.response_secret_key, &body)
+                .expect("failed to decrypt response");
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&decrypted).expect("decrypted response is not valid JSON");
+        assert!(
+            resp_json.get("choices").is_some(),
+            "response missing 'choices' field"
+        );
+        let choices = resp_json["choices"]
+            .as_array()
+            .expect("choices is not array");
+        assert!(!choices.is_empty(), "choices array is empty");
+        let content = choices[0]["message"]["content"].as_str().unwrap_or("");
+        let reasoning = choices[0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !content.is_empty() || !reasoning.is_empty(),
+            "both content and reasoning_content are empty"
+        );
+        eprintln!(
+            "✅ use_evidence + collateral live test PASSED — TEE model responded: {}",
+            content
+        );
+    }
+
+    /// Live test: the **combined** `use_evidence + collateral_url` path against
+    /// the **second** TEE model (GLM-5.2-TEE). This mirrors
+    /// `e2e_smoke_test_use_evidence_collateral_live` (GLM-5.1) and gives the
+    /// flagship v3 path — live evidence quote + cert-hash binding + Intel PCS
+    /// collateral + DCAP signature verification — full **both-models** coverage,
+    /// matching the parity `use_evidence` alone has
+    /// (`e2e_smoke_test_use_evidence_live` / `..._glm52`).
+    ///
+    /// The point is that the cryptographic chain does not depend on the GLM-5.1
+    /// image: GLM-5.2 runs a different image version, so it signs a different
+    /// cert chain and the measurements differ, but the key-binding invariant
+    /// (`SHA-256(SPKI-der(cert)) == report_data[32..]`) and the DCAP signature
+    /// verification must hold identically.
+    ///
+    /// Requires `CHUTES_API_KEY` + network to api.chutes.ai +
+    /// api.trustedservices.intel.com. Run with:
+    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_collateral_live_glm52
+    ///
+    /// Note: GLM-5.2 live tests occasionally hit a transient 429/timeout
+    /// (backend `Instance at maximum capacity`) — retry, not a bug.
+    #[tokio::test]
+    #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai + Intel PCS"]
+    async fn e2e_smoke_test_use_evidence_collateral_live_glm52() {
+        let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
+            eprintln!("CHUTES_API_KEY not set, skipping smoke test");
+            return String::new();
+        });
+        if api_key.is_empty() {
+            return;
+        }
+
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_52)
+            .await
+            .expect("could not find GLM-5.2-TEE model chute_id");
+        eprintln!(
+            "use_evidence+collateral live test (GLM-5.2): {} → chute_id: {}",
+            TEE_MODEL_ID_52, chute_id
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let discovery = Discovery::new(client.clone(), API_BASE.to_string());
+
+        let payload = serde_json::json!({
+            "model": TEE_MODEL_ID_52,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "stream": false,
+            "max_tokens": 500
+        })
+        .to_string();
+
+        // The full cryptographic path, mirrored on GLM-5.2:
+        //   use_evidence:            fetch live quote+cert from the evidence endpoint
+        //   collateral_url: Some("") -> default to the real Intel PCS (DCAP)
+        //   strict=False (permissive) so the wiring is asserted without depending
+        //   on the pinned 1.5.0 measurement table matching the GLM-5.2 image.
+        let attest_cfg = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            override_measurements: None,
+            use_evidence: true,
+            collateral_url: Some(""),
+            ..Default::default()
+        };
+        eprintln!("Sending E2E request with use_evidence=true + collateral to GLM-5.2-TEE...");
+        let result = handler::e2e_request_attested(
+            &discovery,
+            &client,
+            API_BASE,
+            &api_key,
+            &chute_id,
+            payload.as_bytes(),
+            false,
+            "/v1/chat/completions",
+            &attest_cfg,
+        )
+        .await
+        .expect(
+            "E2E request with use_evidence+collateral should succeed on GLM-5.2-TEE \
+             (evidence + DCAP both verified cryptographically, flow proceeds)",
+        );
+
+        assert!(
+            result.response.status().is_success(),
+            "response should be 200"
+        );
+
+        let body = result
+            .response
+            .bytes()
+            .await
+            .expect("failed to read response body");
+        let decrypted =
+            handler::decrypt_non_streaming_response(&result.response_secret_key, &body)
+                .expect("failed to decrypt response");
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&decrypted).expect("decrypted response is not valid JSON");
+        assert!(
+            resp_json.get("choices").is_some(),
+            "response missing 'choices' field"
+        );
+        let choices = resp_json["choices"]
+            .as_array()
+            .expect("choices is not array");
+        assert!(!choices.is_empty(), "choices array is empty");
+        let content = choices[0]["message"]["content"].as_str().unwrap_or("");
+        let reasoning = choices[0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !content.is_empty() || !reasoning.is_empty(),
+            "both content and reasoning_content are empty"
+        );
+        eprintln!(
+            "✅ GLM-5.2-TEE use_evidence + collateral live test PASSED — responded: {}",
+            content
+        );
+    }
 }

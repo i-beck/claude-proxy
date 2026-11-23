@@ -26,6 +26,15 @@
 //! directly. There is no public `/e2e/quote/{id}` or `/e2e/attestation/{id}`
 //! endpoint (all return 404).
 //!
+//! **However**, the user-reachable evidence endpoint
+//! `GET /instances/{id}/evidence?nonce=<64-hex>` proxies the miner's
+//! attestation service and returns a real TDX quote + cert + GPU evidence.
+//! When `AttestationConfig::node_ip` is `None`, `e2e_request_attested` can
+//! still fetch a live quote via this evidence path (see `handler.rs`), then
+//! verify it with DCAP against Intel PCS when `collateral_url` is set. The
+//! raw `:30443/server/attest` hop below remains validator-gated and is the
+//! only path that is truly unreachable by a user API client.
+//!
 //! Consequently this module provides:
 //! - A `TdxQuote` parser that works on any raw quote bytes (for when a quote
 //!   is supplied by a caller, a future API field, or a test fixture).
@@ -570,9 +579,10 @@ impl<'a> Default for VerifyParams<'a> {
 /// 2. REPORTDATA nonce matches `expected_nonce`.
 /// 3. REPORTDATA cert_hash matches SHA-256 of `expected_pubkey`.
 ///
-/// It does NOT verify the quote's cryptographic signature (DCAP) — that
-/// requires Intel PCS collateral and is the trusted-root step documented
-/// separately. `signature_verified` in the result is always `false` here.
+/// It performs DCAP cryptographic signature verification when
+/// `params.collateral` is `Some` (calls `verify_dcap`); when collateral is
+/// `None` (the default), `signature_verified` stays `false` and the check
+/// falls back to measurement + key binding alone.
 pub fn verify(quote: &TdxQuote, params: &VerifyParams<'_>) -> AttestationResult {
     // Resolve the expected measurements: override > pinned table.
     let (exp_mrtd, exp_rtmr1, exp_rtmr2, exp_rtmr3) = match params.override_measurements {
@@ -862,7 +872,7 @@ pub fn verify_dcap(raw_quote: &[u8], collateral: &DcapCollateral, now_secs: u64)
 // default `e2e_request_attested` path leaves them `None` and behaves exactly
 // as before (verify a quote carried on `/e2e/instances`, else permissive).
 //
-// ## Why the client cannot fetch a quote by default (verified 2026-11-19)
+// ## Why the client cannot fetch a quote via the raw miner hop (verified 2026-11-19)
 //
 // The miner's TEE worker exposes `/server/attest?nonce=<64-hex>` on NodePort
 // 30443, but that NodePort bridges to the EXTERNAL proxy port (8443), whose
@@ -872,8 +882,13 @@ pub fn verify_dcap(raw_quote: &[u8], collateral: &DcapCollateral, now_secs: u64)
 // (user) has no validator credential, and the Chutes user API exposes no
 // endpoint that maps instance_id → server IP (`/instances/{id}` and
 // `/servers/{instance_id}/attestation-status` return 404; `/servers/{id}`
-// needs miner auth). So `fetch_quote_from_miner` is only reachable when the
-// operator supplies the node IP out-of-band.
+// needs miner auth). So `fetch_quote_from_miner` (this raw hop) is only
+// reachable when the operator supplies the node IP out-of-band.
+//
+// NOTE: this is NOT the only quote path. The user-reachable evidence endpoint
+// `GET /instances/{id}/evidence?nonce=<64-hex>` proxies the same attestation
+// service and returns a real TDX quote without validator credentials — see
+// `e2e_request_attested` in `handler.rs` and §8.7 of the investigation doc.
 
 /// The miner's public attestation NodePort (per chutes-miner docs).
 pub const MINER_ATTESTATION_PORT: u16 = 30443;
@@ -1027,13 +1042,21 @@ pub struct EvidenceFetch {
 /// `new_attestation_nonce()`/`/instances/nonce` is echoed as the 64 ASCII
 /// bytes (NOT decoded to 32 bytes), so it never equals the 64-hex of
 /// `report_data[..32]`. Pass the base64 E2E pool nonce to get a verbatim echo.
-pub async fn fetch_quote_from_chutes_api(
+/// Shared HTTP + JSON-parse core for the Chutes evidence endpoint.
+///
+/// `GET {api_base}/instances/{instance_id}/evidence?nonce={nonce}` with
+/// `Authorization: Bearer {api_key}`. Returns the parsed `TeeInstanceEvidence`
+/// JSON object (carrying `quote`, `certificate`, `signature`, `attested_body`,
+/// `gpu_evidence`). Both [`fetch_quote_from_chutes_api`] and
+/// [`fetch_quote_with_cert`] call this so the transport + status + parse logic
+/// lives in exactly one place.
+async fn fetch_evidence_json(
     client: &reqwest::Client,
     api_base: &str,
     api_key: &str,
     instance_id: &str,
     nonce: &str,
-) -> Result<Vec<u8>, AttestationFetchError> {
+) -> Result<serde_json::Value, AttestationFetchError> {
     let url = format!(
         "{}/instances/{}/evidence?nonce={}",
         api_base.trim_end_matches('/'),
@@ -1057,15 +1080,28 @@ pub async fn fetch_quote_from_chutes_api(
             String::from_utf8_lossy(&body).into_owned(),
         ));
     }
-    let v: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| AttestationFetchError::Malformed(format!("evidence json: {e}")))?;
+    serde_json::from_slice(&body)
+        .map_err(|e| AttestationFetchError::Malformed(format!("evidence json: {e}")))
+}
+
+/// Decode the base64 `quote` field out of a parsed evidence JSON object.
+fn decode_quote_field(v: &serde_json::Value) -> Result<Vec<u8>, AttestationFetchError> {
     let quote_b64 = v
         .get("quote")
         .and_then(|x| x.as_str())
         .ok_or_else(|| AttestationFetchError::Malformed("evidence has no quote field".into()))?;
-    let quote = base64_decode(quote_b64)
-        .map_err(|_| AttestationFetchError::Malformed("bad base64 quote".into()))?;
-    Ok(quote)
+    base64_decode(quote_b64).map_err(|_| AttestationFetchError::Malformed("bad base64 quote".into()))
+}
+
+pub async fn fetch_quote_from_chutes_api(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    instance_id: &str,
+    nonce: &str,
+) -> Result<Vec<u8>, AttestationFetchError> {
+    let v = fetch_evidence_json(client, api_base, api_key, instance_id, nonce).await?;
+    decode_quote_field(&v)
 }
 
 /// Extract the SubjectPublicKeyInfo DER bytes from a base64-encoded X.509
@@ -1095,37 +1131,8 @@ pub async fn fetch_quote_with_cert(
     instance_id: &str,
     nonce: &str,
 ) -> Result<EvidenceFetch, AttestationFetchError> {
-    let url = format!(
-        "{}/instances/{}/evidence?nonce={}",
-        api_base.trim_end_matches('/'),
-        instance_id,
-        nonce
-    );
-    let resp = client
-        .get(&url)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
-        .send()
-        .await
-        .map_err(|e| AttestationFetchError::Http(e.to_string()))?;
-    let status = resp.status();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| AttestationFetchError::Http(e.to_string()))?;
-    if !status.is_success() {
-        return Err(AttestationFetchError::Status(
-            status.as_u16(),
-            String::from_utf8_lossy(&body).into_owned(),
-        ));
-    }
-    let v: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| AttestationFetchError::Malformed(format!("evidence json: {e}")))?;
-    let quote_b64 = v
-        .get("quote")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| AttestationFetchError::Malformed("evidence has no quote field".into()))?;
-    let quote = base64_decode(quote_b64)
-        .map_err(|_| AttestationFetchError::Malformed("bad base64 quote".into()))?;
+    let v = fetch_evidence_json(client, api_base, api_key, instance_id, nonce).await?;
+    let quote = decode_quote_field(&v)?;
     let certificate_b64 = v
         .get("certificate")
         .and_then(|x| x.as_str())
@@ -1490,6 +1497,136 @@ fn root_crl_url(pem_chain: &str) -> Result<Option<String>, AttestationFetchError
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+// ── Mock-PCS collateral fetch (deterministic offline coverage) ──────────
+//
+// The collateral-fetch *success* arm (handler.rs:432-433 + 446-449) is
+// only exercised by `e2e_smoke_test_use_evidence_collateral_live`, which
+// hits Intel PCS over the network and is flaky (the fixture save-gate
+// SKIPS when `ATTESTATION_SAVE_COLLATERAL` is unset; the live tests run
+// the Err arm when PCS 429s). A mock PCS serving the captured
+// `live_tdx_collateral.json` lets `fetch_intel_pcs_collateral` run the
+// success path deterministically offline. Exposed as `pub(crate)` so the
+// handler integration tests can drive `e2e_request_attested`'s collateral
+// success arm through the same fixture.
+
+/// Spin up a minimal axum HTTP server that serves the 3 PCS collateral
+/// endpoints (`/sgx/certification/v4/pckcrl`,
+/// `/tdx/certification/v4/tcb`, `/tdx/certification/v4/qe/identity`)
+/// from the captured fixture. Returns the bound port and a JoinHandle.
+#[cfg(test)]
+pub(crate) async fn start_mock_pcs_server(
+) -> (u16, tokio::task::JoinHandle<()>) {
+    use axum::{
+        extract::Query,
+        http::{header::HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
+    use serde::Deserialize;
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/live_tdx_collateral.json"
+    ))
+    .expect("live collateral fixture should parse");
+
+    #[derive(Deserialize)]
+    struct PckParams {
+        ca: String,
+    }
+    #[derive(Deserialize)]
+    struct TcbParams {
+        fmspc: String,
+    }
+    #[derive(Deserialize)]
+    struct QeParams {
+        #[allow(dead_code)]
+        update: String,
+    }
+
+    let app = Router::new()
+        .route(
+            "/sgx/certification/v4/pckcrl",
+            {
+                let fx = fixture.clone();
+                get(move |Query(_p): Query<PckParams>| async move {
+                    // The fixture stores pck_crl as a hex string (DER CRL
+                    // bytes). Hex-decode it to the raw DER body.
+                    let body_hex = fx.get("pck_crl").and_then(|v| v.as_str()).unwrap_or("");
+                    let issuer = fx
+                        .get("pck_crl_issuer_chain")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let issuer = url_encode(issuer);
+                    let mut headers = HeaderMap::new();
+                    headers.insert("SGX-PCK-CRL-Issuer-Chain", axum::http::HeaderValue::from_str(&issuer).unwrap());
+                    let der = hex::decode(body_hex).unwrap_or_default();
+                    (StatusCode::OK, headers, der)
+                })
+            },
+        )
+        .route(
+            "/tdx/certification/v4/tcb",
+            {
+                let fx = fixture.clone();
+                get(move |Query(_p): Query<TcbParams>| async move {
+                    let body = fx.get("tcb_info").and_then(|v| v.as_str()).unwrap_or("");
+                    let issuer = fx
+                        .get("tcb_info_issuer_chain")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let issuer = url_encode(issuer);
+                    let mut headers = HeaderMap::new();
+                    headers.insert("TCB-Info-Issuer-Chain", axum::http::HeaderValue::from_str(&issuer).unwrap());
+                    let json: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+                    (StatusCode::OK, headers, axum::Json(serde_json::json!({"tcbInfo": json, "signature": fx.get("tcb_info_signature").and_then(|v| v.as_str()).unwrap_or("")})))
+                })
+            },
+        )
+        .route(
+            "/tdx/certification/v4/qe/identity",
+            {
+                let fx = fixture.clone();
+                get(move |Query(_p): Query<QeParams>| async move {
+                    let body = fx.get("qe_identity").and_then(|v| v.as_str()).unwrap_or("");
+                    let issuer = fx
+                        .get("qe_identity_issuer_chain")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let issuer = url_encode(issuer);
+                    let mut headers = HeaderMap::new();
+                    headers.insert("SGX-Enclave-Identity-Issuer-Chain", axum::http::HeaderValue::from_str(&issuer).unwrap());
+                    let json: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+                    (StatusCode::OK, headers, axum::Json(serde_json::json!({"enclaveIdentity": json, "signature": fx.get("qe_identity_signature").and_then(|v| v.as_str()).unwrap_or("")})))
+                })
+            },
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (port, handle)
+}
+
+/// URL-encode a PEM chain for use as an HTTP header (same encoding Intel
+/// PCS uses). `%XX` uppercase, no `+` for spaces.
+#[cfg(test)]
+pub(crate) fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3233,4 +3370,300 @@ mod tests {
             full.summary
         );
     }
+
+    /// Live proof of the `use_evidence` **key-binding invariant**: fetch a real
+    /// TDX quote + TEE attestation cert from the user-reachable evidence
+    /// endpoint, extract the cert's SPKI DER, and assert
+    /// `SHA-256(SPKI-der(cert)) == report_data[32..]` — the exact invariant the
+    /// handler's `use_evidence` path verifies (with `skip_nonce_binding`). Also
+    /// fetches live Intel PCS collateral and runs `verify_dcap` to confirm the
+    /// quote's DCAP signature verifies `UpToDate` against real Intel PCS.
+    ///
+    /// This is the live counterpart to the offline
+    /// `test_extract_spki_der_from_real_cert` +
+    /// `test_use_evidence_valid_quote_proceeds_in_strict_mode` mocks. Unlike
+    /// `test_full_attestation_orchestration_live_api` (which used
+    /// `expected_pubkey = report_data[32..]` and therefore got
+    /// `key_binding_verified=false`), this test uses the **cert's SPKI** as
+    /// `expected_pubkey` with `skip_nonce_binding=true`, so it actually proves
+    /// the flagship invariant holds against a live quote.
+    ///
+    /// Requires `CHUTES_API_KEY` + network to api.chutes.ai and Intel PCS.
+    /// Run with:
+    ///   cargo test --release -- --ignored test_evidence_cert_binding_live
+    #[tokio::test]
+    #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai + Intel PCS"]
+    async fn test_evidence_cert_binding_live() {
+        let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
+            eprintln!("CHUTES_API_KEY not set, skipping live evidence-binding test");
+            String::new()
+        });
+        if api_key.is_empty() {
+            return;
+        }
+
+        let chute_id = "b048fe26-0352-5c46-acf7-335e527e7f3d";
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
+
+        // 1. Get a real instance_id from discovery.
+        let discovery =
+            crate::e2ee::discovery::Discovery::new(client.clone(), CHUTES_API_BASE.to_string());
+        let (instance_id, _e2e_pubkey, _e2e_nonce, _quote) = discovery
+            .acquire(chute_id, &api_key)
+            .await
+            .expect("discovery should return TEE instances");
+        eprintln!("live evidence-binding test: instance_id {instance_id}");
+
+        // 2. Fetch a live quote + cert from the user-reachable evidence endpoint.
+        let nonce = fetch_attestation_nonce(&client, CHUTES_API_BASE, &api_key)
+            .await
+            .expect("nonce fetch");
+        let ev =
+            fetch_quote_with_cert(&client, CHUTES_API_BASE, &api_key, &instance_id, &nonce)
+                .await
+                .expect("live evidence fetch");
+        assert!(!ev.certificate_b64.is_empty(), "evidence should carry a cert");
+        assert!(ev.quote.len() >= MIN_QUOTE_SIZE, "live quote too short");
+
+        // 3. THE FLAGSHIP INVARIANT: SHA-256(SPKI-der(cert)) == report_data[32..].
+        let parsed = parse_quote(&ev.quote).expect("live quote should parse");
+        let spki = extract_spki_der(&ev.certificate_b64).expect("SPKI extract");
+        let (_got_nonce, got_cert_hash) = split_report_data(&parsed.report_data);
+        let exp_cert_hash = pubkey_hash_hex(&spki);
+        eprintln!(
+            "live evidence-binding test: got_cert_hash={} exp_cert_hash={}",
+            got_cert_hash, exp_cert_hash
+        );
+        assert_eq!(
+            got_cert_hash, exp_cert_hash,
+            "the evidence key-binding invariant must hold live: \
+             SHA-256(SPKI-der(cert)) == report_data[32..]"
+        );
+
+        // 4. Full verify through the exact path the handler's `use_evidence`
+        //    takes: skip_nonce_binding + cert-hash binding + live DCAP
+        //    collateral. Use measurement overrides matching the live quote's
+        //    own values (self-consistency, like
+        //    test_full_attestation_orchestration_live_api) so the test does
+        //    not depend on the pinned version table matching the live image.
+        let collateral = fetch_intel_pcs_collateral(&client, &ev.quote, None)
+            .await
+            .expect("live PCS collateral fetch");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let override_meas = MeasurementOverride {
+            mrtd: Some(reg_to_hex(&parsed.mrtd)),
+            rtmr1: Some(reg_to_hex(&parsed.rtmr1)),
+            rtmr2: Some(reg_to_hex(&parsed.rtmr2)),
+            rtmr3: Some(reg_to_hex(&parsed.rtmr3)),
+        };
+        let params = VerifyParams {
+            expected_version: "live",
+            expected_nonce: &nonce,
+            expected_pubkey: &spki,
+            override_measurements: Some(&override_meas),
+            mode: AttestationMode::Strict,
+            collateral: Some(&collateral),
+            now_secs: now,
+            skip_nonce_binding: true,
+        };
+        let full = verify(&parsed, &params);
+        eprintln!(
+            "live evidence-binding test: verified={} sig={} m={} kb={} tcb={:?}",
+            full.verified,
+            full.signature_verified,
+            full.measurements_verified,
+            full.key_binding_verified,
+            full.tcb_status
+        );
+        // The cert-hash key binding must verify (the flagship invariant).
+        assert!(
+            full.key_binding_verified,
+            "key binding must verify via cert SPKI (skip_nonce_binding): {}",
+            full.summary
+        );
+        // DCAP signature must verify against real Intel PCS.
+        assert!(
+            full.signature_verified,
+            "DCAP signature must verify against live Intel PCS: {}",
+            full.summary
+        );
+        // In strict mode with a current TCB, the full attestation should verify.
+        assert!(
+            full.verified,
+            "strict-mode attestation should verify live (measurements + \
+             cert-binding + DCAP): {}",
+            full.summary
+        );
+    }
+
+    // ── extract_spki_der tests (evidence-path key binding helper) ──────────
+    //
+    // The evidence path's key-binding invariant is:
+    //   SHA-256(SPKI-der(evidence_certificate)) == report_data[32..]
+    // These tests exercise the `extract_spki_der` helper that the handler
+    // uses to pull the SPKI out of the evidence cert, plus its error paths.
+
+    /// The real TEE attestation certificate captured from the GLM-5.1-TEE
+    /// evidence endpoint (base64 DER), and the quote it was fetched alongside.
+    const EVIDENCE_CERT_B64: &str = include_str!("../../tests/fixtures/evidence_cert.b64");
+
+    #[test]
+    fn test_extract_spki_der_from_real_cert() {
+        // The real evidence cert is a valid X.509 DER; extract_spki_der must
+        // return a non-empty DER blob whose SHA-256 equals the quote's
+        // report_data[32..] cert-hash half.
+        let spki = extract_spki_der(EVIDENCE_CERT_B64).expect("real cert should parse");
+        assert!(!spki.is_empty(), "SPKI DER must be non-empty");
+
+        // Cross-check against the real quote's report_data cert-hash half.
+        let quote = include_bytes!("../../tests/fixtures/evidence_quote.bin");
+        let parsed = parse_quote(quote).expect("real quote should parse");
+        let (_, got_cert_hash) = split_report_data(&parsed.report_data);
+        assert_eq!(
+            pubkey_hash_hex(&spki),
+            got_cert_hash,
+            "SHA-256(SPKI-der(cert)) must equal the quote's report_data[32..] \
+             cert-hash (the evidence key-binding invariant)"
+        );
+    }
+
+    #[test]
+    fn test_extract_spki_der_not_base64() {
+        let err = extract_spki_der("!!! not base64 !!!").unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Malformed(_)));
+    }
+
+    #[test]
+    fn test_extract_spki_der_garbage_der() {
+        // Valid base64 but not a DER certificate.
+        let garbage = crate::e2ee::discovery::base64_encode(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let err = extract_spki_der(&garbage).unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Malformed(_)));
+    }
+
+    // ── fetch_quote_with_cert mock-server tests (evidence fetch helper) ─────
+
+    /// Spin up a mock evidence endpoint that returns the given JSON body, and
+    /// return its base URL.
+    async fn start_mock_evidence_server(
+        body: serde_json::Value,
+        status: u16,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/instances/:instance_id/evidence",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    use axum::http::StatusCode;
+                    use axum::response::IntoResponse;
+                    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+                    (code, axum::Json(body)).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_quote_with_cert_mock() {
+        // Serve the real evidence response JSON; fetch should decode the quote
+        // bytes and carry the certificate through.
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/evidence_response.json"
+        ))
+        .unwrap();
+        let (base_url, handle) = start_mock_evidence_server(body, 200).await;
+        let client = reqwest::Client::new();
+        let nonce = "nonce-abc-123";
+        let ev = fetch_quote_with_cert(&client, &base_url, "test-key", "inst-1", nonce)
+            .await
+            .expect("evidence fetch should succeed");
+        // Quote decodes to the real 5243-byte TDX quote.
+        assert_eq!(ev.quote, include_bytes!("../../tests/fixtures/evidence_quote.bin"));
+        // Certificate is carried through verbatim.
+        assert_eq!(ev.certificate_b64, EVIDENCE_CERT_B64);
+        // The echoed nonce is the one we passed.
+        assert_eq!(ev.nonce_b64, nonce);
+        // The fetched quote parses and its cert-hash half matches the cert SPKI.
+        let parsed = parse_quote(&ev.quote).expect("fetched quote should parse");
+        let spki = extract_spki_der(&ev.certificate_b64).expect("SPKI extract");
+        let (_, got_cert_hash) = split_report_data(&parsed.report_data);
+        assert_eq!(pubkey_hash_hex(&spki), got_cert_hash);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_quote_with_cert_missing_quote_field() {
+        // Response has a certificate but no quote → Malformed.
+        let body = serde_json::json!({"certificate": EVIDENCE_CERT_B64});
+        let (base_url, handle) = start_mock_evidence_server(body, 200).await;
+        let client = reqwest::Client::new();
+        let err = fetch_quote_with_cert(&client, &base_url, "test-key", "inst-1", "n")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Malformed(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_quote_with_cert_error_status() {
+        let body = serde_json::json!({"detail": "not found"});
+        let (base_url, handle) = start_mock_evidence_server(body, 404).await;
+        let client = reqwest::Client::new();
+        let err = fetch_quote_with_cert(&client, &base_url, "test-key", "inst-1", "n")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Status(404, _)));
+        handle.abort();
+    }
+
+    /// Mock-PCS fetch of the collateral success arm: deterministic offline
+    /// coverage for `fetch_intel_pcs_collateral` → parser → DcapCollateral.
+    #[tokio::test]
+    async fn test_fetch_intel_pcs_collateral_mock_server() {
+        let quote = include_bytes!("../../tests/fixtures/live_tdx_quote.bin").to_vec();
+        let (port, handle) = start_mock_pcs_server().await;
+        let base_url = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let collateral = fetch_intel_pcs_collateral(&client, &quote, Some(&base_url))
+            .await
+            .expect("mock PCS collateral fetch should succeed");
+        // The fixture's PCK CA is platform; the fixture quote's is processor.
+        // The mock server always returns the fixture's data regardless of the
+        // `ca` query param, so `verify` may not match the quote — but the
+        // *fetch and parse* path should complete successfully.
+        assert!(!collateral.pck_crl.is_empty(), "pck_crl should be fetched");
+        assert!(!collateral.tcb_info.is_empty(), "tcb_info should be fetched");
+        assert!(!collateral.qe_identity.is_empty(), "qe_identity should be fetched");
+        // tcb_info/qe_identity JSON fields are strings inside the response;
+        // after json-extraction they must equal the fixture's own values.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/live_tdx_collateral.json"
+        ))
+        .expect("live collateral fixture should parse");
+        assert_eq!(
+            collateral.tcb_info.as_str(),
+            fixture.get("tcb_info").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        assert_eq!(
+            collateral.qe_identity.as_str(),
+            fixture.get("qe_identity").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        handle.abort();
+    }
 }
+

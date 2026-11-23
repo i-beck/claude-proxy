@@ -25,6 +25,12 @@ Thumbs.db
 /tmp
 *.tmp
 
+# Coverage reports / profiling artifacts
+coveragereport/
+cov.lcov
+*.profraw
+*.profdata
+
 # API Specification Sources (cloned for reference, not tracked)
 /anthropic-spec/
 /openai-spec/

@@ -1,5 +1,23 @@
 # E2E Attestation API Investigation — 2026-11-19
 
+> **CURRENT STATUS (2026-11-23, v3 — use_evidence evidence-path live-verified):** the original
+> "NOT VERIFIABLE by this client" claims in §6 and the no-quote "current live
+> state" in §7 are **OUTDATED**. The committed v2/v3 work (branch
+> `2026-11_refresh`, commits `5ded623` + `ce6b255`) now does all three:
+> (1) **DCAP cryptographic signature verification** is implemented via
+> `dcap-qvl` 0.7.1 + a manual 4-step Intel PCS v4 collateral fetch — `signature_verified`
+> is `true` when collateral is supplied and DCAP verify succeeds (see §8.3,
+> §8.7); it is only `false` on the no-collateral fallback path. (2) **Quote
+> retrieval** works through the user-reachable
+> `GET /instances/{id}/evidence?nonce=<64-hex>` endpoint, which proxies the
+> miner's attestation service — a live 5243-byte TDX quote was fetched and
+> verified `UpToDate` / `signature_verified=true` against real Intel PCS
+> (see §8.7). (3) The raw `:30443/server/attest` miner hop remains
+> validator-gated and unreachable by a user API client — that single
+> limitation is the only thing still "not verifiable by this client." Read
+> §8 for the current reality; §1–§7 are the original dated investigation log
+> and are accurate as of their date.
+
 ## Method
 
 Probed `api.chutes.ai` live with a valid `CHUTES_SMOKE_TEST_KEY` (Bearer auth),
@@ -144,21 +162,32 @@ Minimum quote size: 48 + 584 = 632 bytes.
 
 ### NOT VERIFIABLE by this client (documented limitations)
 
-1. **DCAP cryptographic signature verification** — proving the quote was
-   signed by genuine Intel hardware via Intel PCS collateral. This is the
-   trusted root of the chain. Requires `dcap-qvl` + network access to Intel
-   PCS for the quoting enclave's collateral. The `dcap-qvl` 0.7.1 crate
-   (pure-Rust, by Phala) exists but needs network fetch of Intel PCS
-   certificates. `signature_verified` in `AttestationResult` is always
-   `false` in this implementation.
+> **SUPERSEDED by §8 (2026-11-20/22).** Items 1 and 2 below are no longer
+> true: DCAP signature verification is implemented (`signature_verified` is
+> `true` when collateral is supplied — see §8.3/§8.7) and quote retrieval
+> works through the user-reachable `/instances/{id}/evidence?nonce=` endpoint
+> (a live 5243-byte quote was fetched and verified `UpToDate`). The only
+> remaining "not verifiable by this client" item is the raw
+> `:30443/server/attest` miner hop, which stays validator-gated. Items 3 and
+> 4 (image version, RTMR0) remain accurate.
 
-2. **Quote retrieval** — the client cannot fetch a TDX quote today. The
-   `/e2e/instances` response carries no quote, and the real quote endpoint
-   (`/server/attest` on the per-VM attestation-proxy, port 8443) is
-   reachable only inside the Chutes cluster network. If the API starts
-   returning quotes in a future `quote` field on `/e2e/instances`, the
-   client will verify them automatically (the `InstanceRaw.quote` field is
-   already parsed via `#[serde(default)]`).
+1. **DCAP cryptographic signature verification** — *SUPERSEDED: now
+   implemented via `dcap-qvl` + manual Intel PCS v4 collateral fetch (§8.3).
+   `signature_verified` is `true` when collateral is supplied and DCAP verify
+   succeeds; it is only `false` on the no-collateral fallback path.* (Original
+   2026-11-19 note: this was the trusted root of the chain and required
+   `dcap-qvl` + network access to Intel PCS; the `dcap-qvl` 0.7.1 crate
+   (pure-Rust, by Phala) was used but the `report` feature was avoided in
+   favor of a manual 4-step fetch.)
+
+2. **Quote retrieval** — *SUPERSEDED: the client now fetches a live TDX quote
+   through `GET /instances/{id}/evidence?nonce=<64-hex>` (§8.7), which proxies
+   the miner's attestation service. The raw `/server/attest` endpoint on
+   port 8443 remains reachable only inside the Chutes cluster network /
+   validator-gated.* (Original 2026-11-19 note: the `/e2e/instances` response
+   carries no quote, so if the API started returning quotes in a `quote` field
+   the client would verify them automatically — the `InstanceRaw.quote` field
+   is parsed via `#[serde(default)]`.)
 
 3. **Image version** — the `/e2e/instances` response does not report which
    guest image version a TEE instance is running. The client must be told
@@ -186,19 +215,35 @@ Minimum quote size: 48 + 584 = 632 bytes.
 
 ## 7. Client behavior summary
 
+> **SUPERSEDED by §8 (2026-11-20/22).** The "no quote is present (the current
+> live state)" premise below is outdated: the client now actively fetches a
+> live TDX quote via `/instances/{id}/evidence?nonce=` (§8.7) and, when
+> `AttestationConfig::collateral_url` is set, verifies it with DCAP
+> (`signature_verified=true`). The no-quote path below still applies as a
+> fallback when no quote/collateral is configured, and §8.4 adds a
+> control-plane `check_attestation_status` fallback. Kept here as the original
+> dated description of the design.
+
 The client (`e2e_request_attested`) does:
 
 1. Acquire `(instance_id, e2e_pubkey, nonce, quote?)` from discovery.
-2. If a `quote` is present: parse it, verify MRTD/RTMR1-3 against the pinned
-   table for the configured `expected_version`, and verify REPORTDATA
-   binds the nonce + pubkey hash. In strict mode, failure refuses
-   encryption; in permissive mode, it logs and proceeds.
-3. If no `quote` is present (the current live state): strict mode refuses;
-   permissive mode logs "no quote from instance" and proceeds to encrypt.
+   — *v2/v3 addition:* optionally **fetch** a live quote from
+   `/instances/{id}/evidence` and Intel PCS collateral when the operator
+   supplies `AttestationConfig` fields (see §8).
+2. If a `quote` is present (or was fetched): parse it, verify MRTD/RTMR1-3
+   against the pinned table for the configured `expected_version`, verify
+   REPORTDATA binds the nonce + pubkey hash, and — when collateral is
+   supplied — run the DCAP signature verification (sets `signature_verified`).
+   In strict mode, failure refuses encryption; in permissive mode, it logs
+   and proceeds.
+3. If no `quote` is present (now a **fallback**, not the only live state):
+   strict mode refuses; permissive mode logs "no quote from instance" and
+   proceeds to encrypt. With `check_status: true` the handler first consults
+   the control-plane `verified` flag (§8.4).
 
-This is safe-by-design: when Chutes ships quote material on `/e2e/instances`,
-the verification path is already wired and will reject wrong-MRTD quotes in
-strict mode without any client code change.
+This is safe-by-design: the verification path rejects wrong-MRTD /
+bad-signature quotes in strict mode, whether the quote came from
+`/e2e/instances` or was fetched live.
 
 ## 8. Attestation v2 — live quote + PCS collateral fetch (2026-11-20)
 
@@ -211,10 +256,12 @@ The v2 implementation adds three network-fetch paths to
 | Function | Purpose | Gate |
 |---|---|---|
 | `fetch_quote_from_miner(client, node_ip, nonce)` | Fetch a live TDX quote from the miner's public attestation service (`https://{node_ip}:30443/server/attest?nonce=…`) | `AttestationConfig::node_ip: Some(...)` |
+| `fetch_quote_with_cert(client, api_base, api_key, instance_id, nonce)` | Fetch a live TDX quote **and** its TEE attestation certificate from the user-reachable evidence endpoint `GET /instances/{id}/evidence?nonce=<64-hex>` (no validator token, no node IP — see §8.7/§8.8). Returns `EvidenceFetch { quote, certificate_b64, nonce_b64 }`. | `AttestationConfig::use_evidence: true` |
+| `extract_spki_der(certificate_b64)` | Pull the SubjectPublicKeyInfo DER out of the evidence cert (base64 X.509) so the handler can verify the quote's key-binding half: `SHA-256(SPKI-der(cert)) == report_data[32..]` | `use_evidence` (cert-binding half) |
 | `fetch_intel_pcs_collateral(client, quote, pcs_base)` | Fetch Intel PCS collateral (PCK CRL, TCB info, QE identity) for a quote and assemble a `QuoteCollateralV3` for DCAP verification | `AttestationConfig::collateral_url: Some(...)` |
 | `check_attestation_status(client, api_base, api_key, chute_id, instance_id)` | Best-effort control-plane check via `GET /chutes/{id}` → `instances[].verified` | `AttestationConfig::check_status: true` |
 
-### 8.2 Why the client cannot fetch a quote by default
+### 8.2 Why the client cannot fetch a quote via the raw miner hop
 
 The miner's TEE worker exposes `/server/attest?nonce=<64-hex>` on NodePort
 30443, but that NodePort bridges to the EXTERNAL proxy port (8443), whose
@@ -229,8 +276,15 @@ endpoint that maps `instance_id` → server IP:
 - `/instances/{instance_id}` → 404
 - `/chutes/{chute_id}` → 200, but only exposes `instances[].verified`
 
-So `fetch_quote_from_miner` is only reachable when the operator supplies the
-node IP out-of-band (via `AttestationConfig::node_ip`).
+So `fetch_quote_from_miner` (this raw hop) is only reachable when the
+operator supplies the node IP out-of-band (via `AttestationConfig::node_ip`).
+
+**This is NOT the only quote path.** The user-reachable evidence endpoint
+`GET /instances/{id}/evidence?nonce=<64-hex>` (§8.7) proxies the same
+attestation service and returns a real TDX quote + cert + GPU evidence
+without validator credentials. So a user API client *can* fetch a live quote
+— via the evidence endpoint, not the raw miner hop. The raw hop above is the
+only path that is truly unreachable by a user API client.
 
 ### 8.3 Intel PCS collateral fetch
 
@@ -293,15 +347,25 @@ is made.
 | `fetch_quote_simple` mock-server (binary, JSON, error, refused) | 4 | `attestation.rs` |
 | `AttestationFetchError` display | 1 | `attestation.rs` |
 | `check_attestation_status` mock-server (verified, unverified, not-found, empty, missing, error) | 6 | `handler.rs` |
-| `check_status` integration through `e2e_request_attested` (verified/strict, unverified/strict, unverified/permissive, not-found/strict, error/strict) | 5 | `handler.rs` |
+| `check_status` integration through `e2e_request_attested` (verified/strict, unverified/strict, unverified/permissive, not-found/strict, error/strict, not-found/permissive, error/permissive) | 7 | `handler.rs` |
 | `node_ip` integration through `e2e_request_attested` (unreachable/strict→refuse, unreachable/permissive→proceed) | 2 | `handler.rs` |
 | Real-fixture fetch pipeline (bare binary + JSON envelope → fetch → decode → parse → FMSPC extract) | 2 | `attestation.rs` |
-| `#[ignore]` network tests (live miner, live PCS, full flow, live check_status GLM-5.1, live check_status GLM-5.2, full orchestration) | 6 | `attestation.rs` + `smoke.rs` |
-| **Total new tests** | **35** | |
+| `extract_spki_der` (real cert binding, not-base64, garbage-DER) | 3 | `attestation.rs` |
+| `fetch_quote_with_cert` mock-server (real-evidence decode, missing-quote, error-status) | 3 | `attestation.rs` |
+| `use_evidence` integration through `e2e_request_attested` (valid/strict→proceed, fetch-error/strict→refuse, fetch-error/permissive→proceed, empty-cert/strict→refuse, malformed-cert/strict→refuse, collateral-error/strict→refuse, collateral-error/permissive→proceed, collateral-success/permissive→proceed) | 8 | `handler.rs` |
+| `fetch_intel_pcs_collateral` mock-PCS offline (deterministic collateral-fetch *success* arm via a mock PCS serving the captured `live_tdx_collateral.json`) | 1 | `attestation.rs` |
+| Error-shape / passthrough (E2EError `Display` all variants, `From<DiscoveryError>`/`From<CryptoError>` conversions, non-403 passthrough in `e2e_request`, `Parse`-error and non-success-invoke through `e2e_request_attested`) | 5 | `handler.rs` |
+| `#[ignore]` network/live tests (live PCS, full flow, live check_status GLM-5.1, live check_status GLM-5.2, full orchestration, live save-collateral fixture, live use_evidence binding+DCAP, live e2e_smoke_test_use_evidence, live e2e_smoke_test_use_evidence_glm52, live e2e_smoke_test_use_evidence_collateral, live e2e_smoke_test_use_evidence_collateral_glm52) | 15 | `attestation.rs` + `smoke.rs` |
+| **Total new tests** | **68** (53 non-ignored + 15 `#[ignore]`) | |
 
-Total test suite: **659 passed, 0 failed, 8 ignored** (629 baseline + 31 new
-unit/integration + 6 `#[ignore]` network/live tests). The full orchestration
-test (`test_full_attestation_orchestration_mock_miner_live_pcs`) runs the
+The row counts above are category descriptions, not an exact addend ledger;
+the authoritative numbers come from the test runner. Total test suite (as of
+2026-11-23, after the `use_evidence` evidence-path work + the deterministic
+mock-PCS collateral-success test): **682 passed, 0 failed, 15 ignored**
+(629 baseline + 53 new non-ignored + 15 `#[ignore]` network/live tests —
+matches §8.8).
+The full orchestration test
+(`test_full_attestation_orchestration_mock_miner_live_pcs`) runs the
 complete pipeline — mock miner serving the real fixture → fetch → parse → live
 Intel PCS fetch → `verify_dcap` → `verify` — and is live-verified. The
 `check_status` path is live-verified against **both** TEE models: GLM-5.1-TEE
@@ -314,6 +378,16 @@ accepts, and `verify_dcap` returns `OutOfDate` for the June-2025 fixture verifie
 at the current time (the correct result — Intel has advanced the TCB level since
 then). Note: Intel PCS serves TDX collateral at the **v4** endpoints
 (`/tdx/certification/v4/...`); the v3 endpoints return 404.
+
+**2026-11-23 update — the flagship `use_evidence` path is now live-verified
+end-to-end against the real Chutes API + real Intel PCS, on BOTH TEE models.**
+Four new live tests close the gap that was previously mocked only:
+
+- **`test_evidence_cert_binding_live` (`attestation.rs`, `#[ignore]`)** — the rigorous proof: fetches a real quote + cert from the user-reachable evidence endpoint, extracts the SPKI from the cert, and asserts `SHA-256(SPKI-der(cert)) == report_data[32..]` — the exact `use_evidence` key-binding invariant the handler verifies with `skip_nonce_binding`. Then runs live DCAP collateral fetch + `verify_dcap` and asserts `UpToDate`. Result (live, GLM-5.1-TEE): `verified=true signature_verified=true measurements_verified=true key_binding_verified=true tcb=Some("UpToDate")`. This closes the gap that was previously offline-only: the earlier "live" `test_full_attestation_orchestration_live_api` deliberately does NOT assert key binding (its doc-comment notes the fixture path can't supply the TEE public key), so it only proved measurements + DCAP. `test_evidence_cert_binding_live` is the first live proof of the cert-hash key-binding invariant.
+- **`e2e_smoke_test_use_evidence_live` (`smoke.rs`, `#[ignore]`, GLM-5.1-TEE)** — the wiring proof: drives `e2e_request_attested` with `use_evidence: true` in permissive mode end-to-end and asserts a valid decrypted response from the real TEE model (proving the handler's new branch does not break the live flow). This is the `use_evidence` analog of the existing `e2e_smoke_test_check_status_live`.
+- **`e2e_smoke_test_use_evidence_live_glm52` (`smoke.rs`, `#[ignore]`, GLM-5.2-TEE)** — the cross-model wiring proof: same as above but against the second TEE image (`zai-org/GLM-5.2-TEE`, chute `08901219-...`), confirming the evidence-path key-binding invariant is not specific to the GLM-5.1 image. Mirrors `e2e_smoke_test_check_status_live_glm52` so `use_evidence` has the same both-models coverage `check_status` has.
+- **`e2e_smoke_test_use_evidence_collateral_live` (`smoke.rs`, `#[ignore]`, GLM-5.1-TEE)** — the **combined** cryptographic path through the handler: `use_evidence: true` + `collateral_url: Some("")` (empty string → default Intel PCS base). One `e2e_request_attested` call fetches the live quote+cert, verifies the cert-hash binding, fetches Intel PCS collateral, and runs the DCAP signature verification. Permissive mode so the live flow proceeds even if the pinned-measurement table doesn't match the live image (strict-mode evidence is covered offline in `test_use_evidence_valid_quote_proceeds_in_strict_mode`). Live result: TEE model responded "Hello" — the full evidence+DCAP chain works end-to-end through the handler.
+- **`e2e_smoke_test_use_evidence_collateral_live_glm52` (`smoke.rs`, `#[ignore]`, GLM-5.2-TEE, added 2026-11-23)** — the **same** combined `use_evidence + collateral` path mirrored on the second TEE image (`zai-org/GLM-5.2-TEE`, chute `08901219-...`). This closes the last parity gap: the flagship v3 combined path now has **both-models** live coverage, matching the parity `use_evidence` alone has (`e2e_smoke_test_use_evidence_live` / `..._glm52`) and `check_status` has. The cert-hash binding + DCAP chain is model-agnostic — GLM-5.2 signs a different cert chain and has different measurements, but the invariants hold identically. Live result: PASSED on retry after the documented transient GLM-5.2 429 ("Instance at maximum capacity") — not a bug.
 
 ### 8.7 Live verification (2026-11-20)
 
@@ -374,10 +448,56 @@ ATTESTATION_SAVE_COLLATERAL=1 cargo test --release -- --ignored test_live_save_c
 
 **This v2 attestation work is verified end-to-end against REAL infrastructure and runs against the default test suite without any fixtures being stale or skipped.**
 
-1. **Real TDX quote from a real miner**: `test_full_attestation_orchestration_live_api` (`--ignore`d network test) fetched a live 5243-byte TDX quote from a GLM-5.1-TEE miner (instance `b50da4c0-...` / chute `b048fe26-0352-...`), parsed `MRTD=261CE538...` matching the pinned v1.5.0 table, and verified with **dcap-qvl → `UpToDate`, `signature_verified=true`** against real Intel PCS collateral fetched live over the network. The user-reachable `/instances/{id}/evidence?nonce=<64-hex-server-nonce>` endpoint is the real production path (it proxies the miner's attestation service; the raw `:30443/server/attest` hop is validator-gated and unreachable).
+1. **Real TDX quote from a real miner**: `test_full_attestation_orchestration_live_api` (`--ignore`d network test) fetched a live 5243-byte TDX quote from a GLM-5.1-TEE miner (instance `b50da4c0-...` / chute `b048fe26-0352-...`), parsed `MRTD=261CE538...` matching the pinned v1.5.0 table, and verified with **dcap-qvl → `UpToDate`, `signature_verified=true`** against real Intel PCS collateral fetched live over the network. The user-reachable `/instances/{id}/evidence?nonce=<64-hex-server-nonce>` endpoint is the real production path (it proxies the miner's attestation service; the raw `:30443/server/attest` hop is validator-gated and unreachable). **Gap closed 2026-11-23**: this test deliberately does NOT assert key binding (its doc-comment notes key binding needs the actual TEE public key, which the fixture path can't supply), so it only proved measurements + DCAP. The rigorous `use_evidence` key-binding proof was previously offline-only; it is now live in `test_evidence_cert_binding_live` (§8.8), which passes the cert's SPKI as `expected_pubkey` with `skip_nonce_binding=true` and asserts `key_binding_verified=true signature_verified=true tcb=UpToDate` against a real quote.
 
 2. **Offline reproducibility in the DEFAULT suite**: `test_live_quote_dcap_verify_offline` (non-`#[ignore]`d) re-verifies the captured `live_tdx_quote.bin` against `live_tdx_collateral.json` (fresh TCB info issued 2026-11-22T23:48:16Z, nextUpdate 2026-12-22) with dcap-qvl → `UpToDate`, `signature_verified=true`. This runs automatically in `cargo test` — no fixtures, no skips, no excuses.
 
 3. **Collateral regeneration gate**: `ATTESTATION_SAVE_COLLATERAL=1 cargo test -- --ignored test_live_save_collateral_fixture` writes a fresh `live_tdx_collateral.json` via `fetch_intel_pcs_collateral` + real Intel PCS, so the offline fixture never goes stale. Full default-suite result after commit `5ded623`: `660 passed, 0 failed, 10 ignored; 0 measured; 0 filtered out` (the 10 ignored are network tests + the save-fixture gate).
 
-4. **No commit/push per the user's hard constraint**: all v2 changes were committed on `2026-11_refresh` in a single commit (`5ded623`). `git status` shows a clean tree afterward.
+4. **No commit/push per the user's hard constraint**: all v2 changes were committed on `2026-11_refresh` in two commits (`5ded623` + `ce6b255`). The subsequent `use_evidence` evidence-path work (§8.8) is currently **uncommitted** in the working tree (per the same constraint).
+
+### 8.8 The `use_evidence` evidence path (2026-11-23)
+
+The flagship v3 path: a user API client with **no node IP** fetches a live TDX
+quote + TEE attestation certificate from the user-reachable evidence endpoint
+`GET /instances/{id}/evidence?nonce=<fresh-64-hex>` and verifies the quote's
+key-binding half against the returned cert.
+
+- **`AttestationConfig::use_evidence: bool`** (default `false`) gates the
+  whole path; when `true` and no live miner quote was fetched (`node_ip` is
+  `None` or failed), the handler calls `fetch_quote_with_cert` with the E2E
+  discovery `instance_id` and a fresh binding nonce.
+- **`fetch_quote_with_cert`** hits the user-reachable evidence endpoint
+  (Bearer auth, no validator token, no node IP), decodes the base64 `quote`
+  field into raw TDX quote bytes, and carries the `certificate` field through
+  verbatim. Errors: `Status(code, body)` on non-2xx, `Malformed` when the
+  `quote` field is missing or non-base64.
+- **`extract_spki_der`** pulls the SubjectPublicKeyInfo DER out of the
+  base64-X.509 evidence cert (via `x509-cert`). The handler uses it to verify
+  the cert-hash half of REPORTDATA: `SHA-256(SPKI-der(cert)) ==
+  report_data[32..]`.
+- **`skip_nonce_binding`**: because the evidence endpoint generates its own
+  nonce (confirmed live — the server nonce is not client-bindable to the
+  nonce half of REPORTDATA), the handler sets `VerifyParams::skip_nonce_binding
+  = true` on this path so `verify()` requires only the cert-hash key binding +
+  measurements (+ DCAP signature when collateral is also supplied). Freshness
+  of the quote is instead established by fetching it with a fresh server nonce
+  from `GET /instances/nonce`. This flag is **only** set on the evidence path;
+  every other path (`/e2e/instances` quote, miner fetch) keeps the strict
+  nonce + cert-hash requirement.
+
+**Preserved security invariant**: `should_proceed` in strict mode still
+requires `verified == true`, which means measurements (MRTD/RTMR1-3 pinned to
+`expected_version`) + the cert-hash key binding + (when `collateral_url` is
+set) the DCAP signature. The evidence path relaxes only the nonce half of
+REPORTDATA; it never relaxes measurements or DCAP. Fetch/extract failures in
+strict mode refuse to encrypt; permissive mode logs and proceeds.
+
+**Offline end-to-end proof** (all in the default suite, real captured
+fixtures — see `tests/fixtures/evidence_quote.bin`, `evidence_cert.b64`,
+`evidence_response.json`): the real captured evidence quote is fetched →
+decoded → parsed, and the evidence cert's SPKI SHA-256 provably equals the
+quote's `report_data[32..]` cert-hash. `test_use_evidence_valid_quote_proceeds_in_strict_mode`
+drives the full `e2e_request_attested` flow through a mock server with the
+real quote+cert and proceeds in strict mode, proving the binding invariant is
+exercised end-to-end offline.

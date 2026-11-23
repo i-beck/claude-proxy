@@ -1643,6 +1643,78 @@ mod tests {
         handle.abort();
     }
 
+    /// `check_status` + NotFound + permissive mode → PROCEEDS (logs the warning,
+    /// falls through to the no-quote permissive path). Covers the
+    /// `Ok(AttestationStatus::NotFound) => Permissive` arm (handler.rs:498-500).
+    #[tokio::test]
+    async fn test_check_status_not_found_proceeds_in_permissive_mode() {
+        let chutes_body = serde_json::json!({
+            "instances": [{"instance_id": "other-instance", "verified": true}]
+        });
+        let (api_base, handle) = start_no_quote_with_chutes_mock(chutes_body, 200).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            check_status: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "NotFound status should proceed in permissive mode: {:?}",
+            result.err()
+        );
+        handle.abort();
+    }
+
+    /// `check_status` + status-check error + permissive mode → PROCEEDS (logs
+    /// the warning, falls through). Covers the `Err(e) => Permissive` arm
+    /// (handler.rs:509-510).
+    #[tokio::test]
+    async fn test_check_status_error_proceeds_in_permissive_mode() {
+        let chutes_body = serde_json::json!({"detail": "internal error"});
+        let (api_base, handle) = start_no_quote_with_chutes_mock(chutes_body, 500).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            check_status: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "status check error should proceed in permissive mode: {:?}",
+            result.err()
+        );
+        handle.abort();
+    }
+
     // ── Integration: node_ip wiring through e2e_request_attested ───────────
 
     #[tokio::test]
@@ -1845,5 +1917,676 @@ mod tests {
             result.is_ok(),
             "unreachable node_ip in permissive mode should proceed"
         );
+    }
+
+    // ── Integration: use_evidence wiring through e2e_request_attested ──────
+    //
+    // The flagship v3 path: a user API client with no node IP fetches a live
+    // TDX quote + TEE cert from the user-reachable evidence endpoint
+    // (`GET /instances/{id}/evidence`), and the handler verifies the quote's
+    // cert-hash half against `SHA-256(SPKI-der(cert))` (skip_nonce_binding),
+    // then proceeds to encrypt. These tests use the REAL captured quote+cert
+    // fixtures so the cert-binding invariant is exercised end-to-end offline.
+
+    /// Helper: start a mock server that serves /e2e/instances (NO quote), the
+    /// evidence endpoint `/instances/:id/evidence`, and /e2e/invoke (which
+    /// decrypts the request and re-encrypts a response). Returns the base URL.
+    async fn start_evidence_mock(
+        evidence_body: serde_json::Value,
+        evidence_status: u16,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{
+            body::Bytes,
+            http::HeaderMap,
+            routing::{get, post},
+            Json, Router,
+        };
+
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = discovery::base64_encode(&server_kp.public_key);
+        let server_sk = std::sync::Arc::new(tokio::sync::Mutex::new(server_kp.secret_key.clone()));
+        let resp_plaintext = br#"{"ok":true}"#.to_vec();
+
+        // /e2e/instances returns an instance with NO quote (the evidence path
+        // is the only quote source here).
+        let instances_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-evidence-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["nonce-a"],
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let server_sk_clone = server_sk.clone();
+        let evidence_body_clone = evidence_body.clone();
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = instances_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/instances/:instance_id/evidence",
+                get(move || async move {
+                    use axum::http::StatusCode;
+                    use axum::response::IntoResponse;
+                    let code =
+                        StatusCode::from_u16(evidence_status).unwrap_or(StatusCode::OK);
+                    (code, evidence_body_clone.to_string()).into_response()
+                }),
+            )
+            .route(
+                "/e2e/invoke",
+                post(move |_headers: HeaderMap, body: Bytes| {
+                    let server_sk = server_sk_clone.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        let sk = server_sk.lock().await;
+                        let req_plaintext = crypto::decrypt_request_blob(&sk, &body).unwrap();
+                        let req_json: serde_json::Value =
+                            serde_json::from_slice(&req_plaintext).unwrap();
+                        let resp_pk_b64 = req_json["e2e_response_pk"].as_str().unwrap();
+                        let resp_pk = discovery::base64_decode(resp_pk_b64).unwrap();
+                        let (mlkem_ct, shared_secret) =
+                            crypto::encapsulate_against_server_pubkey(&resp_pk).unwrap();
+                        let salt = &mlkem_ct[..16];
+                        let resp_key =
+                            crypto::hkdf_sha256(&shared_secret, salt, crypto::HKDF_INFO_RESPONSE)
+                                .unwrap();
+                        let compressed = crypto::gzip_compress(&resp_plaintext).unwrap();
+                        let nonce = crypto::random_bytes(12);
+                        let ciphertext =
+                            crypto::chacha20poly1305_seal(&resp_key, &nonce, &compressed, b"")
+                                .unwrap();
+                        let (ct_part, tag_part) = ciphertext.split_at(ciphertext.len() - 16);
+                        let resp_blob =
+                            crypto::build_request_blob(&mlkem_ct, &nonce, ct_part, tag_part);
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            resp_blob,
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{addr}"), handle)
+    }
+
+    /// The real captured evidence response (quote + cert) from a GLM-5.1-TEE
+    /// miner. The quote's REPORTDATA cert-hash half equals
+    /// `SHA-256(SPKI-der(cert))`, so the evidence key-binding invariant holds.
+    const EVIDENCE_RESPONSE: &str =
+        include_str!("../../tests/fixtures/evidence_response.json");
+
+    /// `use_evidence` + valid real quote/cert → strict mode PROCEEDS (the
+    /// evidence path is cryptographic: cert-hash binding passes). This is the
+    /// end-to-end proof that the user-reachable evidence path works offline.
+    #[tokio::test]
+    async fn test_use_evidence_valid_quote_proceeds_in_strict_mode() {
+        let evidence_body: serde_json::Value = serde_json::from_str(EVIDENCE_RESPONSE).unwrap();
+        let (api_base, handle) = start_evidence_mock(evidence_body, 200).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+
+        // The real quote is a 1.4.1 image; pin to that version. The cert-hash
+        // binding is checked via the evidence cert SPKI (skip_nonce_binding is
+        // set automatically when the cert is extracted).
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "use_evidence with a valid real quote+cert should proceed in strict mode: {:?}",
+            result.err()
+        );
+        handle.abort();
+    }
+
+    /// `use_evidence` + evidence endpoint error (404) → strict mode REFUSES.
+    /// Confirms the error path of the evidence fetch is wired into the gate.
+    #[tokio::test]
+    async fn test_use_evidence_fetch_error_refuses_in_strict_mode() {
+        let evidence_body = serde_json::json!({"detail": "evidence not found"});
+        let (api_base, handle) = start_evidence_mock(evidence_body, 404).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "use_evidence with a failed evidence fetch should refuse in strict mode"
+        );
+        match result.unwrap_err() {
+            E2EError::Attestation(_) => {} // expected
+            other => panic!("expected Attestation error for failed evidence fetch, got {other:?}"),
+        }
+        handle.abort();
+    }
+
+    /// `use_evidence` + evidence endpoint error → permissive mode PROCEEDS
+    /// (logs the failed fetch and falls through to the no-quote permissive path).
+    #[tokio::test]
+    async fn test_use_evidence_fetch_error_proceeds_in_permissive_mode() {
+        let evidence_body = serde_json::json!({"detail": "evidence not found"});
+        let (api_base, handle) = start_evidence_mock(evidence_body, 404).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Permissive,
+            use_evidence: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "use_evidence with a failed evidence fetch should proceed in permissive mode"
+        );
+        handle.abort();
+    }
+
+    /// `use_evidence` + valid quote but EMPTY certificate → the handler skips
+    /// SPKI extraction and falls back to E2E-pubkey key binding. In strict mode
+    /// this MUST fail: the quote's REPORTDATA cert-hash half was bound to the
+    /// TEE attestation-service cert, not the E2E ML-KEM key, so `key_ok` is
+    /// false and `should_proceed` refuses. Covers the empty-cert branch
+    /// (handler.rs `if !ev.certificate_b64.is_empty()`) and the fallback to
+    /// `(&server_pubkey[..], false)` — the non-evidence key-binding path.
+    #[tokio::test]
+    async fn test_use_evidence_empty_cert_refuses_in_strict_mode() {
+        // Same real quote as the valid-cert test, but with the `certificate`
+        // field stripped out so the handler can't extract the SPKI.
+        let mut evidence_body: serde_json::Value =
+            serde_json::from_str(EVIDENCE_RESPONSE).unwrap();
+        evidence_body["certificate"] = serde_json::Value::String(String::new());
+        let (api_base, handle) = start_evidence_mock(evidence_body, 200).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "use_evidence with an empty cert should fail key binding in strict mode \
+             (quote binds TEE cert, not E2E key): {:?}",
+            result.err()
+        );
+        match result.unwrap_err() {
+            E2EError::Attestation(_) => {} // expected — key binding failed
+            other => panic!(
+                "expected Attestation error for empty-cert key-binding failure, got {other:?}"
+            ),
+        }
+        handle.abort();
+    }
+
+    /// `use_evidence` + valid quote but MALFORMED certificate (non-empty, not
+    /// valid base64 DER) → `extract_spki_der` returns `Err`, the handler logs a
+    /// warning and falls back to E2E-pubkey key binding. In strict mode this
+    /// MUST fail for the same reason as the empty-cert case: the quote's
+    /// REPORTDATA cert-hash half was bound to the TEE cert, not the E2E key.
+    /// Covers the `Err(e) => log::warn!(...)` branch (handler.rs:391) — the
+    /// malformed-cert fallback path.
+    #[tokio::test]
+    async fn test_use_evidence_malformed_cert_refuses_in_strict_mode() {
+        // Same real quote, but the certificate is non-empty garbage that
+        // fails base64 decoding inside extract_spki_der.
+        let mut evidence_body: serde_json::Value =
+            serde_json::from_str(EVIDENCE_RESPONSE).unwrap();
+        evidence_body["certificate"] =
+            serde_json::Value::String("not-a-valid-base64-cert!!!".to_string());
+        let (api_base, handle) = start_evidence_mock(evidence_body, 200).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "use_evidence with a malformed cert should fail key binding in strict mode \
+             (SPKI extract fails → fallback to E2E key, quote binds TEE cert): {:?}",
+            result.err()
+        );
+        match result.unwrap_err() {
+            E2EError::Attestation(_) => {} // expected — key binding failed
+            other => panic!(
+                "expected Attestation error for malformed-cert key-binding failure, got {other:?}"
+            ),
+        }
+        handle.abort();
+    }
+
+    /// `use_evidence` + valid quote+cert + `collateral_url` pointing at a dead
+    /// port → PCS fetch fails → strict mode REFUSES. Covers the error arm of
+    /// the collateral fetch (handler.rs:436-441): the `Err(e) => log::warn` +
+    /// `if attest.mode == Strict { return Err(...) }` branch.
+    #[tokio::test]
+    async fn test_use_evidence_collateral_error_refuses_in_strict_mode() {
+        let evidence_body: serde_json::Value =
+            serde_json::from_str(EVIDENCE_RESPONSE).unwrap();
+        let (api_base, handle) = start_evidence_mock(evidence_body, 200).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            collateral_url: Some("http://127.0.0.1:1"),
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "collateral fetch failure should refuse in strict mode: {:?}",
+            result.err()
+        );
+        match result.unwrap_err() {
+            E2EError::Attestation(_) => {} // expected — collateral fetch failed
+            other => panic!("expected Attestation error, got {other:?}"),
+        }
+        handle.abort();
+    }
+
+    /// `use_evidence` + valid quote+cert + `collateral_url` pointing at a mock
+    /// PCS that serves the captured `live_tdx_collateral.json` → the PCS fetch
+    /// SUCCEEDS and the request proceeds. Covers the collateral-fetch *success*
+    /// arm (handler.rs:432-433: `Ok(c) => { log::info!(...); collateral = Some(c) }`)
+    /// and the `now_secs` branch (handler.rs:446-449: `if collateral.is_some()`
+    /// → `SystemTime::now()`). Permissive mode so a DCAP signature mismatch on
+    /// the mock collateral doesn't refuse the request — the goal is exercising
+    /// the success path, not the DCAP verdict.
+    #[tokio::test]
+    async fn test_use_evidence_collateral_success_proceeds_in_permissive_mode() {
+        let evidence_body: serde_json::Value =
+            serde_json::from_str(EVIDENCE_RESPONSE).unwrap();
+        let (api_base, handle) = start_evidence_mock(evidence_body, 200).await;
+        let (pcs_port, pcs_handle) = crate::e2ee::attestation::start_mock_pcs_server().await;
+        // Bind the URL to a local so the `&str` outlives the `attest` struct
+        // (a bare `&format!(...)` temporary would be dropped at the end of the
+        // `let` statement, leaving `collateral_url` dangling).
+        let pcs_url = format!("http://127.0.0.1:{pcs_port}");
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Permissive,
+            use_evidence: true,
+            collateral_url: Some(&pcs_url),
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "collateral fetch success should proceed in permissive mode: {:?}",
+            result.err()
+        );
+        handle.abort();
+        pcs_handle.abort();
+    }
+
+    /// Same as above but permissive mode → PROCEEDS (logs the collateral fetch
+    /// warning, falls through). Covers the permissive branch of the collateral
+    /// fetch error path (handler.rs:436-441 → fall-through).
+    #[tokio::test]
+    async fn test_use_evidence_collateral_error_proceeds_in_permissive_mode() {
+        let evidence_body: serde_json::Value =
+            serde_json::from_str(EVIDENCE_RESPONSE).unwrap();
+        let (api_base, handle) = start_evidence_mock(evidence_body, 200).await;
+        let client = reqwest::Client::new();
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.4.1",
+            mode: AttestationMode::Permissive,
+            use_evidence: true,
+            collateral_url: Some("http://127.0.0.1:1"),
+            ..Default::default()
+        };
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "collateral fetch failure should proceed in permissive mode: {:?}",
+            result.err()
+        );
+        handle.abort();
+    }
+
+    // ── Error-shape / passthrough coverage ────────────────────────────────
+    //
+    // These close the remaining reachable production lines: the `Display`
+    // arms, the `From` conversions, and the non-403 / non-success passthrough
+    // branches in `e2e_request` / `e2e_request_attested`.
+
+    /// Covers every arm of `impl Display for E2EError` (handler.rs:28-34).
+    #[tokio::test]
+    async fn test_e2eerror_display_all_variants() {
+        let discovery_err = E2EError::Discovery(DiscoveryError::NoNonces);
+        assert!(format!("{discovery_err}").starts_with("discovery:"));
+        let crypto_err = E2EError::Crypto(CryptoError::Keygen);
+        assert!(format!("{crypto_err}").starts_with("crypto:"));
+        // A real reqwest::Error from a connection failure.
+        let client = reqwest::Client::new();
+        let http_err = client.get("http://127.0.0.1:1").send().await.unwrap_err();
+        let http_e2e = E2EError::Http(http_err);
+        assert!(format!("{http_e2e}").starts_with("http:"));
+        let status_err = E2EError::Status(403, "nope".into());
+        assert!(format!("{status_err}").starts_with("status 403:"));
+        let parse_err = E2EError::Parse("bad".into());
+        assert!(format!("{parse_err}").starts_with("parse:"));
+        let no_nonce = E2EError::NoNonce;
+        assert_eq!(format!("{no_nonce}"), "no nonce available");
+        let attest_err = E2EError::Attestation(AttestationError::QuoteTooShort { len: 0 });
+        assert!(format!("{attest_err}").starts_with("attestation:"));
+    }
+
+    /// Covers `From<DiscoveryError>` (handler.rs:42-44) and
+    /// `From<CryptoError>` (handler.rs:47-49).
+    #[test]
+    fn test_e2eerror_from_conversions() {
+        let d: E2EError = DiscoveryError::NoNonces.into();
+        match d {
+            E2EError::Discovery(_) => {}
+            other => panic!("expected Discovery, got {other:?}"),
+        }
+        let c: E2EError = CryptoError::Keygen.into();
+        match c {
+            E2EError::Crypto(_) => {}
+            other => panic!("expected Crypto, got {other:?}"),
+        }
+    }
+
+    /// A non-JSON payload makes `inject_response_pk` fail with `Parse`, which
+    /// `e2e_request_once` returns and `e2e_request` passes through via the
+    /// `Err(e) => Err(e)` arm (handler.rs:187). Covers L187 + L211.
+    #[tokio::test]
+    async fn test_e2e_request_bad_payload_passthrough() {
+        use axum::{routing::get, Json, Router};
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = discovery::base64_encode(&server_kp.public_key);
+        let resp_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["nonce-a"],
+            }],
+            "nonce_expires_in": 60
+        });
+        let app = Router::new().route(
+            "/e2e/instances/:chute_id",
+            get(move || {
+                let body = resp_body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        // Valid UTF-8 but not JSON → inject_response_pk Parse error.
+        let payload = b"not valid json at all";
+        let result = e2e_request(
+            &discovery,
+            &client,
+            &api_base,
+            "key",
+            "chute",
+            payload,
+            false,
+            "/v1/chat/completions",
+        )
+        .await;
+        match result {
+            Err(E2EError::Parse(_)) => {} // expected
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    /// Same as above but through `e2e_request_attested`: permissive mode with
+    /// no quote proceeds to the inject step, where a bad payload yields a
+    /// `Parse` error (handler.rs:533).
+    #[tokio::test]
+    async fn test_attested_request_bad_payload_parse_error() {
+        use axum::{routing::get, Json, Router};
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = discovery::base64_encode(&server_kp.public_key);
+        let resp_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["nonce-a"],
+            }],
+            "nonce_expires_in": 60
+        });
+        let app = Router::new().route(
+            "/e2e/instances/:chute_id",
+            get(move || {
+                let body = resp_body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            ..Default::default()
+        };
+        let payload = b"not valid json at all";
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "key",
+            "chute",
+            payload,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        match result {
+            Err(E2EError::Parse(_)) => {} // expected
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    /// Attestation passes (permissive, no quote) but the invoke endpoint
+    /// returns a non-2xx status → `e2e_request_attested` surfaces it as
+    /// `Status` (handler.rs:554-555).
+    #[tokio::test]
+    async fn test_attested_request_invoke_non_success_status() {
+        use axum::{
+            body::Bytes,
+            http::HeaderMap,
+            routing::{get, post},
+            Json, Router,
+        };
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = discovery::base64_encode(&server_kp.public_key);
+        let resp_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["nonce-a"],
+            }],
+            "nonce_expires_in": 60
+        });
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = resp_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/e2e/invoke",
+                post(move |_h: HeaderMap, _body: Bytes| async move {
+                    use axum::response::IntoResponse;
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "1.5.0",
+            mode: AttestationMode::Permissive,
+            ..Default::default()
+        };
+        let payload = br#"{"model":"test"}"#;
+        let result = e2e_request_attested(
+            &discovery,
+            &client,
+            &api_base,
+            "key",
+            "chute",
+            payload,
+            false,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await;
+        match result {
+            Err(E2EError::Status(500, _)) => {} // expected
+            other => panic!("expected Status(500) error, got {other:?}"),
+        }
     }
 }
