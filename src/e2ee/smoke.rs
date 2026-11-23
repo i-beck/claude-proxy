@@ -44,7 +44,9 @@ const API_BASE: &str = "https://api.chutes.ai";
 const LLM_MODELS_URL: &str = "https://llm.chutes.ai/v1/models";
 const TEE_MODEL_ID: &str = "zai-org/GLM-5.1-TEE";
 /// Second TEE model for cross-model verification (chute_id from task spec).
-const TEE_MODEL_ID_52: &str = "zai-org/GLM-5.2-TEE";
+/// Swapped 2026-11-23 from `zai-org/GLM-5.2-TEE` (rate-limited / unreachable —
+/// the GLM-5.2 backend returns 429 "Instance at maximum capacity") to Kimi-K3-TEE.
+const TEE_MODEL_ID_K3: &str = "moonshotai/Kimi-K3-TEE";
 
 #[cfg(test)]
 mod smoke_tests {
@@ -397,12 +399,12 @@ mod smoke_tests {
     }
 
     /// Live test: verify the `check_status: true` path works end-to-end against
-    /// the **second** TEE model (GLM-5.2-TEE, chute_id
-    /// `08901219-...`). Confirms `check_attestation_status` works across
+    /// the **second** TEE model (Kimi-K3-TEE, chute_id
+    /// `0bb5d4c2-...`). Confirms `check_attestation_status` works across
     /// different TEE chutes, not just GLM-5.1-TEE.
     #[tokio::test]
     #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai"]
-    async fn e2e_smoke_test_check_status_live_glm52() {
+    async fn e2e_smoke_test_check_status_live_k3() {
         let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
             eprintln!("CHUTES_API_KEY not set, skipping smoke test");
             return String::new();
@@ -411,12 +413,12 @@ mod smoke_tests {
             return;
         }
 
-        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_52)
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_K3)
             .await
-            .expect("could not find GLM-5.2-TEE model chute_id");
+            .expect("could not find Kimi-K3-TEE model chute_id");
         eprintln!(
-            "check_status live test (GLM-5.2): {} → chute_id: {}",
-            TEE_MODEL_ID_52, chute_id
+            "check_status live test (Kimi-K3): {} → chute_id: {}",
+            TEE_MODEL_ID_K3, chute_id
         );
 
         let client = reqwest::Client::builder()
@@ -426,7 +428,7 @@ mod smoke_tests {
         let discovery = Discovery::new(client.clone(), API_BASE.to_string());
 
         let payload = serde_json::json!({
-            "model": TEE_MODEL_ID_52,
+            "model": TEE_MODEL_ID_K3,
             "messages": [{"role": "user", "content": "Say hello in one word."}],
             "stream": false,
             "max_tokens": 500
@@ -440,7 +442,7 @@ mod smoke_tests {
             check_status: true,
             ..Default::default()
         };
-        eprintln!("Sending E2E request with check_status=true to GLM-5.2-TEE...");
+        eprintln!("Sending E2E request with check_status=true to Kimi-K3-TEE...");
         let result = handler::e2e_request_attested(
             &discovery,
             &client,
@@ -487,7 +489,7 @@ mod smoke_tests {
             "both content and reasoning_content are empty"
         );
         eprintln!(
-            "✅ GLM-5.2-TEE check_status live test PASSED — responded: {}",
+            "✅ Kimi-K3-TEE check_status live test PASSED — responded: {}",
             content
         );
     }
@@ -602,18 +604,18 @@ mod smoke_tests {
     }
 
     /// Live test: verify the `use_evidence: true` path works end-to-end against
-    /// the **second** TEE model (GLM-5.2-TEE, chute_id `08901219-...`). Confirms
+    /// the **second** TEE model (Kimi-K3-TEE, chute_id `0bb5d4c2-...`). Confirms
     /// the evidence-path key-binding invariant (`SHA-256(SPKI-der(cert)) ==
     /// report_data[32..]`) is not specific to the GLM-5.1 image — a different
     /// guest image build could (in principle) use a different cert layout or
     /// base64-encode differently. This is the `use_evidence` analog of the
-    /// existing `e2e_smoke_test_check_status_live_glm52`.
+    /// existing `e2e_smoke_test_check_status_live_k3`.
     ///
     /// Requires `CHUTES_API_KEY` + network to api.chutes.ai. Run with:
-    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_live_glm52
+    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_live_k3
     #[tokio::test]
     #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai"]
-    async fn e2e_smoke_test_use_evidence_live_glm52() {
+    async fn e2e_smoke_test_use_evidence_live_k3() {
         let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
             eprintln!("CHUTES_API_KEY not set, skipping smoke test");
             return String::new();
@@ -622,12 +624,12 @@ mod smoke_tests {
             return;
         }
 
-        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_52)
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_K3)
             .await
-            .expect("could not find GLM-5.2-TEE model chute_id");
+            .expect("could not find Kimi-K3-TEE model chute_id");
         eprintln!(
-            "use_evidence live test (GLM-5.2): {} → chute_id: {}",
-            TEE_MODEL_ID_52, chute_id
+            "use_evidence live test (Kimi-K3): {} → chute_id: {}",
+            TEE_MODEL_ID_K3, chute_id
         );
 
         let client = reqwest::Client::builder()
@@ -637,7 +639,7 @@ mod smoke_tests {
         let discovery = Discovery::new(client.clone(), API_BASE.to_string());
 
         let payload = serde_json::json!({
-            "model": TEE_MODEL_ID_52,
+            "model": TEE_MODEL_ID_K3,
             "messages": [{"role": "user", "content": "Say hello in one word."}],
             "stream": false,
             "max_tokens": 500
@@ -645,7 +647,7 @@ mod smoke_tests {
         .to_string();
 
         // use_evidence: true + permissive mode (assert the wiring, not the
-        // pinned-measurement match — GLM-5.2 runs a different image version
+        // pinned-measurement match — Kimi-K3 runs a different image version
         // than the 1.5.0 default in the other tests).
         let attest_cfg = AttestationConfig {
             expected_version: "1.5.0",
@@ -654,7 +656,7 @@ mod smoke_tests {
             use_evidence: true,
             ..Default::default()
         };
-        eprintln!("Sending E2E request with use_evidence=true to GLM-5.2-TEE...");
+        eprintln!("Sending E2E request with use_evidence=true to Kimi-K3-TEE...");
         let result = handler::e2e_request_attested(
             &discovery,
             &client,
@@ -667,7 +669,7 @@ mod smoke_tests {
             &attest_cfg,
         )
         .await
-        .expect("E2E request with use_evidence should succeed on GLM-5.2-TEE");
+        .expect("E2E request with use_evidence should succeed on Kimi-K3-TEE");
 
         assert!(
             result.response.status().is_success(),
@@ -701,7 +703,7 @@ mod smoke_tests {
             "both content and reasoning_content are empty"
         );
         eprintln!(
-            "✅ GLM-5.2-TEE use_evidence live test PASSED — responded: {}",
+            "✅ Kimi-K3-TEE use_evidence live test PASSED — responded: {}",
             content
         );
     }
@@ -837,28 +839,28 @@ mod smoke_tests {
     }
 
     /// Live test: the **combined** `use_evidence + collateral_url` path against
-    /// the **second** TEE model (GLM-5.2-TEE). This mirrors
+    /// the **second** TEE model (Kimi-K3-TEE). This mirrors
     /// `e2e_smoke_test_use_evidence_collateral_live` (GLM-5.1) and gives the
     /// flagship v3 path — live evidence quote + cert-hash binding + Intel PCS
     /// collateral + DCAP signature verification — full **both-models** coverage,
     /// matching the parity `use_evidence` alone has
-    /// (`e2e_smoke_test_use_evidence_live` / `..._glm52`).
+    /// (`e2e_smoke_test_use_evidence_live` / `..._k3`).
     ///
     /// The point is that the cryptographic chain does not depend on the GLM-5.1
-    /// image: GLM-5.2 runs a different image version, so it signs a different
+    /// image: Kimi-K3 runs a different image version, so it signs a different
     /// cert chain and the measurements differ, but the key-binding invariant
     /// (`SHA-256(SPKI-der(cert)) == report_data[32..]`) and the DCAP signature
     /// verification must hold identically.
     ///
     /// Requires `CHUTES_API_KEY` + network to api.chutes.ai +
     /// api.trustedservices.intel.com. Run with:
-    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_collateral_live_glm52
+    ///   cargo test --release -- --ignored e2e_smoke_test_use_evidence_collateral_live_k3
     ///
-    /// Note: GLM-5.2 live tests occasionally hit a transient 429/timeout
+    /// Note: Kimi-K3 live tests occasionally hit a transient 429/timeout
     /// (backend `Instance at maximum capacity`) — retry, not a bug.
     #[tokio::test]
     #[ignore = "requires CHUTES_API_KEY and network access to api.chutes.ai + Intel PCS"]
-    async fn e2e_smoke_test_use_evidence_collateral_live_glm52() {
+    async fn e2e_smoke_test_use_evidence_collateral_live_k3() {
         let api_key = std::env::var("CHUTES_API_KEY").unwrap_or_else(|_| {
             eprintln!("CHUTES_API_KEY not set, skipping smoke test");
             return String::new();
@@ -867,12 +869,12 @@ mod smoke_tests {
             return;
         }
 
-        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_52)
+        let chute_id = get_chute_id(&api_key, TEE_MODEL_ID_K3)
             .await
-            .expect("could not find GLM-5.2-TEE model chute_id");
+            .expect("could not find Kimi-K3-TEE model chute_id");
         eprintln!(
-            "use_evidence+collateral live test (GLM-5.2): {} → chute_id: {}",
-            TEE_MODEL_ID_52, chute_id
+            "use_evidence+collateral live test (Kimi-K3): {} → chute_id: {}",
+            TEE_MODEL_ID_K3, chute_id
         );
 
         let client = reqwest::Client::builder()
@@ -882,18 +884,18 @@ mod smoke_tests {
         let discovery = Discovery::new(client.clone(), API_BASE.to_string());
 
         let payload = serde_json::json!({
-            "model": TEE_MODEL_ID_52,
+            "model": TEE_MODEL_ID_K3,
             "messages": [{"role": "user", "content": "Say hello in one word."}],
             "stream": false,
             "max_tokens": 500
         })
         .to_string();
 
-        // The full cryptographic path, mirrored on GLM-5.2:
+        // The full cryptographic path, mirrored on Kimi-K3:
         //   use_evidence:            fetch live quote+cert from the evidence endpoint
         //   collateral_url: Some("") -> default to the real Intel PCS (DCAP)
         //   strict=False (permissive) so the wiring is asserted without depending
-        //   on the pinned 1.5.0 measurement table matching the GLM-5.2 image.
+        //   on the pinned 1.5.0 measurement table matching the Kimi-K3 image.
         let attest_cfg = AttestationConfig {
             expected_version: "1.5.0",
             mode: AttestationMode::Permissive,
@@ -902,7 +904,7 @@ mod smoke_tests {
             collateral_url: Some(""),
             ..Default::default()
         };
-        eprintln!("Sending E2E request with use_evidence=true + collateral to GLM-5.2-TEE...");
+        eprintln!("Sending E2E request with use_evidence=true + collateral to Kimi-K3-TEE...");
         let result = handler::e2e_request_attested(
             &discovery,
             &client,
@@ -916,7 +918,7 @@ mod smoke_tests {
         )
         .await
         .expect(
-            "E2E request with use_evidence+collateral should succeed on GLM-5.2-TEE \
+            "E2E request with use_evidence+collateral should succeed on Kimi-K3-TEE \
              (evidence + DCAP both verified cryptographically, flow proceeds)",
         );
 
@@ -953,7 +955,7 @@ mod smoke_tests {
             "both content and reasoning_content are empty"
         );
         eprintln!(
-            "✅ GLM-5.2-TEE use_evidence + collateral live test PASSED — responded: {}",
+            "✅ Kimi-K3-TEE use_evidence + collateral live test PASSED — responded: {}",
             content
         );
     }
