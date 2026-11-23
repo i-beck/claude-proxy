@@ -98,12 +98,12 @@ impl Discovery {
     }
 
     /// Fetch fresh instances + nonces from the control plane.
-    pub async fn refresh(
-        &self,
-        chute_id: &str,
-        api_key: &str,
-    ) -> Result<(), DiscoveryError> {
-        let url = format!("{}/e2e/instances/{}", self.api_base.trim_end_matches('/'), chute_id);
+    pub async fn refresh(&self, chute_id: &str, api_key: &str) -> Result<(), DiscoveryError> {
+        let url = format!(
+            "{}/e2e/instances/{}",
+            self.api_base.trim_end_matches('/'),
+            chute_id
+        );
         let resp = self
             .client
             .get(&url)
@@ -117,10 +117,7 @@ impl Discovery {
             let body = resp.text().await.unwrap_or_default();
             return Err(DiscoveryError::Status(status.as_u16(), body));
         }
-        let parsed: InstancesResponse = resp
-            .json()
-            .await
-            .map_err(DiscoveryError::Parse)?;
+        let parsed: InstancesResponse = resp.json().await.map_err(DiscoveryError::Parse)?;
         let instances = parsed
             .instances
             .into_iter()
@@ -159,9 +156,7 @@ impl Discovery {
         }
         // Refresh and retry.
         self.refresh(chute_id, api_key).await?;
-        self.take_nonce()
-            .await
-            .ok_or(DiscoveryError::NoNonces)
+        self.take_nonce().await.ok_or(DiscoveryError::NoNonces)
     }
 }
 
@@ -346,16 +341,13 @@ mod tests {
                 async move { Json(body) }
             }),
         );
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
-        let discovery = Discovery::new(
-            reqwest::Client::new(),
-            format!("http://{}", addr),
-        );
-        let (instance_id, pub_key, nonce, _quote) = discovery
-            .acquire("chute-x", "test-key")
-            .await
-            .unwrap();
+        let discovery = Discovery::new(reqwest::Client::new(), format!("http://{}", addr));
+        let (instance_id, pub_key, nonce, _quote) =
+            discovery.acquire("chute-x", "test-key").await.unwrap();
         assert_eq!(instance_id, "inst-uuid-1");
         assert_eq!(pub_key.len(), MLKEM_EK_SIZE);
         assert!(nonce == "nonce-a" || nonce == "nonce-b");
@@ -375,14 +367,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let app = Router::new().route(
             "/e2e/instances/:chute_id",
-            get(|| async { (StatusCode::FORBIDDEN, Json(serde_json::json!({"detail": "nonce expired"}))) }),
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"detail": "nonce expired"})),
+                )
+            }),
         );
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
-        let discovery = Discovery::new(
-            reqwest::Client::new(),
-            format!("http://{}", addr),
-        );
+        let discovery = Discovery::new(reqwest::Client::new(), format!("http://{}", addr));
         let result = discovery.acquire("chute-x", "test-key").await;
         assert!(result.is_err());
         match result.unwrap_err() {

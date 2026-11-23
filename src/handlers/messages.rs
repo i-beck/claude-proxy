@@ -1,5 +1,8 @@
 use crate::constants::*;
-use crate::models::{App, CircuitBreakerState, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage, OAIStreamChunk};
+use crate::models::{
+    App, CircuitBreakerState, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage,
+    OAIStreamChunk,
+};
 use crate::services::{
     build_model_list_content, extract_client_key, format_backend_error, get_available_models,
     mask_token, SseEventParser, ToolBuf, ToolsMap,
@@ -701,7 +704,10 @@ async fn process_choice_message(
         // append_non_stream_text_content only pushes {"type":"text","text":..} blocks,
         // so block.get("text").as_str() is always Some.
         if let Some(text) = block.get("text").and_then(Value::as_str) {
-            if !stream_text_delta(tx, state, text).await { return false; } }
+            if !stream_text_delta(tx, state, text).await {
+                return false;
+            }
+        }
     }
 
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -1092,7 +1098,6 @@ async fn run_streaming_task(
         });
     }
 }
-
 
 pub async fn messages(
     State(app): State<App>,
@@ -1690,9 +1695,17 @@ pub async fn messages(
     // Forward client headers, skipping hop-by-hop and headers we set ourselves
     for (name, value) in headers.iter() {
         match name.as_str() {
-            "host" | "connection" | "keep-alive" | "transfer-encoding" | "upgrade"
-            | "proxy-authenticate" | "proxy-authorization" | "te" | "trailers"
-            | "content-type" | "content-length" => {}
+            "host"
+            | "connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "content-type"
+            | "content-length" => {}
             _ => {
                 req = req.header(name, value);
             }
@@ -1819,10 +1832,7 @@ pub async fn messages(
         });
 
         // Read error response body
-        let error_body = res
-            .text()
-            .await
-            .unwrap_or("Unknown error".to_string());
+        let error_body = res.text().await.unwrap_or("Unknown error".to_string());
 
         log::error!(
             "❌ Backend returned error: {} {} - {}",
@@ -2313,7 +2323,9 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
         // Give the spawned server a moment to start accepting connections.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2398,12 +2410,17 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
         // Give the spawned server a moment to start accepting connections.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Warm up the models endpoint (also exercises the models handler).
-        let _ = reqwest::Client::new().get(format!("http://{addr}/v1/models")).send().await;
+        let _ = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await;
 
         (format!("http://{addr}/v1/chat/completions"), captured)
     }
@@ -2446,7 +2463,9 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
         format!("http://{addr}/v1/chat/completions")
     }
@@ -2524,7 +2543,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
         // The flushed error chunk produces error text in the SSE stream.
@@ -2557,7 +2578,9 @@ mod tests {
             let _ = sock
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
                 .await;
-            let _ = sock.write_all(format!("{:X}\r\n", first.len()).as_bytes()).await;
+            let _ = sock
+                .write_all(format!("{:X}\r\n", first.len()).as_bytes())
+                .await;
             let _ = sock.write_all(first.as_bytes()).await;
             let _ = sock.write_all(b"\r\n").await;
             let _ = sock.flush().await;
@@ -2573,7 +2596,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         // Drop the response without consuming → receiver dropped → flush's
         // error emission fails → ClientDisconnected (line 1953).
         drop(response);
@@ -2607,7 +2632,9 @@ mod tests {
             let _ = sock
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
                 .await;
-            let _ = sock.write_all(format!("{:X}\r\n", body.len()).as_bytes()).await;
+            let _ = sock
+                .write_all(format!("{:X}\r\n", body.len()).as_bytes())
+                .await;
             let _ = sock.write_all(body.as_bytes()).await;
             let _ = sock.write_all(b"\r\n").await;
             let _ = sock.flush().await;
@@ -2621,7 +2648,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         // Drop the response so the receiver is gone when the error chunk is
         // processed in the loop → ClientDisconnected (lines 1929-1930).
         drop(response);
@@ -2630,7 +2659,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_flushes_trailing_reasoning_without_final_blank_line() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let body = format!(
             "data: {}\n\ndata: {}",
             json!({
@@ -2676,7 +2705,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_flushes_trailing_tool_arguments_without_final_blank_line() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let body = format!(
             "data: {}\n\ndata: {}\n\ndata: {}",
             json!({
@@ -2749,7 +2778,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_success_returns_claude_json() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "deepseek-r1",
@@ -2773,7 +2802,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_empty_reasoning_content_skips_thinking_block() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Line 1768: a non-streaming backend response with reasoning_content set
         // to an empty string must NOT produce a thinking block (the
         // `if !reasoning.is_empty()` false branch). The response should contain
@@ -2792,7 +2821,8 @@ mod tests {
                 "finish_reason": "stop"
             }],
             "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
-        }).to_string();
+        })
+        .to_string();
         let backend_url = spawn_static_backend(
             StatusCode::OK,
             "application/json",
@@ -2820,7 +2850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_tool_calls_become_tool_use_blocks() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2853,7 +2883,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_missing_model_returns_synthetic_response() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "missing-model",
@@ -2874,7 +2904,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_missing_model_returns_model_list_message() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "missing-model",
@@ -2899,7 +2929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_missing_auth_returns_json_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2921,7 +2951,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_empty_messages_returns_json_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2943,7 +2973,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_open_circuit_breaker_returns_json_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, true);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2964,7 +2994,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_connection_failure_returns_bad_gateway_tuple() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(unused_backend_url().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -2982,7 +3012,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_connection_failure_returns_json_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(unused_backend_url().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -3007,7 +3037,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_retryable_backend_error_returns_status_tuple() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::TOO_MANY_REQUESTS,
             "application/json",
@@ -3036,7 +3066,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_retryable_backend_error_returns_json_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::TOO_MANY_REQUESTS,
             "application/json",
@@ -3066,7 +3096,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_non_retryable_backend_error_returns_sse_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::FORBIDDEN,
             "application/json",
@@ -3095,7 +3125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_backend_parse_failure_returns_json_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::OK,
             "application/json",
@@ -3128,7 +3158,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_translates_assistant_thinking_and_tool_results_for_backend() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3183,7 +3213,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_auto_enables_thinking_for_reasoning_model_from_cache() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         *app.models_cache.write().await = Some(vec![crate::models::ModelInfo {
@@ -3216,7 +3246,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_accepts_claude_code_adaptive_thinking() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
 
@@ -3246,7 +3276,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_disabled_thinking_skips_backend_thinking_field() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         *app.models_cache.write().await = Some(vec![crate::models::ModelInfo {
@@ -3276,7 +3306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_unknown_content_blocks_degrade_to_text_placeholders() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3340,7 +3370,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_truncates_stop_sequences_for_backend_payload() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3365,7 +3395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_translates_documents_for_backend_payload() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -3432,35 +3462,59 @@ mod tests {
     // ========================================================================
     #[test]
     fn test_anthropic_error_type_bad_request() {
-        assert_eq!(anthropic_error_type(StatusCode::BAD_REQUEST), "invalid_request_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::BAD_REQUEST),
+            "invalid_request_error"
+        );
     }
     #[test]
     fn test_anthropic_error_type_unauthorized() {
-        assert_eq!(anthropic_error_type(StatusCode::UNAUTHORIZED), "authentication_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::UNAUTHORIZED),
+            "authentication_error"
+        );
     }
     #[test]
     fn test_anthropic_error_type_forbidden() {
-        assert_eq!(anthropic_error_type(StatusCode::FORBIDDEN), "permission_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::FORBIDDEN),
+            "permission_error"
+        );
     }
     #[test]
     fn test_anthropic_error_type_not_found() {
-        assert_eq!(anthropic_error_type(StatusCode::NOT_FOUND), "not_found_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::NOT_FOUND),
+            "not_found_error"
+        );
     }
     #[test]
     fn test_anthropic_error_type_payload_too_large() {
-        assert_eq!(anthropic_error_type(StatusCode::PAYLOAD_TOO_LARGE), "request_too_large");
+        assert_eq!(
+            anthropic_error_type(StatusCode::PAYLOAD_TOO_LARGE),
+            "request_too_large"
+        );
     }
     #[test]
     fn test_anthropic_error_type_too_many_requests() {
-        assert_eq!(anthropic_error_type(StatusCode::TOO_MANY_REQUESTS), "rate_limit_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::TOO_MANY_REQUESTS),
+            "rate_limit_error"
+        );
     }
     #[test]
     fn test_anthropic_error_type_service_unavailable() {
-        assert_eq!(anthropic_error_type(StatusCode::SERVICE_UNAVAILABLE), "overloaded_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::SERVICE_UNAVAILABLE),
+            "overloaded_error"
+        );
     }
     #[test]
     fn test_anthropic_error_type_internal_server_error() {
-        assert_eq!(anthropic_error_type(StatusCode::INTERNAL_SERVER_ERROR), "api_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::INTERNAL_SERVER_ERROR),
+            "api_error"
+        );
     }
     #[test]
     fn test_anthropic_error_type_bad_gateway() {
@@ -3468,7 +3522,10 @@ mod tests {
     }
     #[test]
     fn test_anthropic_error_type_other_client_error() {
-        assert_eq!(anthropic_error_type(StatusCode::CONFLICT), "invalid_request_error");
+        assert_eq!(
+            anthropic_error_type(StatusCode::CONFLICT),
+            "invalid_request_error"
+        );
     }
 
     // ========================================================================
@@ -3476,7 +3533,13 @@ mod tests {
     // ========================================================================
     #[test]
     fn test_maybe_error_response_stream_returns_err_tuple() {
-        let result = maybe_error_response(true, StatusCode::BAD_REQUEST, "empty", "invalid_request_error", "msg");
+        let result = maybe_error_response(
+            true,
+            StatusCode::BAD_REQUEST,
+            "empty",
+            "invalid_request_error",
+            "msg",
+        );
         assert!(result.is_err());
         let (status, code) = result.unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3484,7 +3547,13 @@ mod tests {
     }
     #[test]
     fn test_maybe_error_response_non_stream_returns_json_response() {
-        let result = maybe_error_response(false, StatusCode::BAD_REQUEST, "empty", "invalid_request_error", "msg");
+        let result = maybe_error_response(
+            false,
+            StatusCode::BAD_REQUEST,
+            "empty",
+            "invalid_request_error",
+            "msg",
+        );
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -3516,7 +3585,10 @@ mod tests {
     }
     #[test]
     fn test_extract_backend_error_message_non_json_raw() {
-        assert_eq!(extract_backend_error_message("plain text error"), "plain text error");
+        assert_eq!(
+            extract_backend_error_message("plain text error"),
+            "plain text error"
+        );
     }
     #[test]
     fn test_extract_backend_error_message_empty_raw() {
@@ -3524,7 +3596,10 @@ mod tests {
     }
     #[test]
     fn test_extract_backend_error_message_whitespace_only_raw() {
-        assert_eq!(extract_backend_error_message("   "), "Unknown backend error");
+        assert_eq!(
+            extract_backend_error_message("   "),
+            "Unknown backend error"
+        );
     }
 
     // ========================================================================
@@ -3615,9 +3690,13 @@ mod tests {
     }
     #[test]
     fn test_extract_text_preview_array_with_text_blocks() {
-        let val = json!([{"text": "first"}, {"text": "second"}, {"text": "third"}, {"text": "fourth"}]);
+        let val =
+            json!([{"text": "first"}, {"text": "second"}, {"text": "third"}, {"text": "fourth"}]);
         // takes only first 3
-        assert_eq!(extract_text_preview(&val), Some("first second third".into()));
+        assert_eq!(
+            extract_text_preview(&val),
+            Some("first second third".into())
+        );
     }
     #[test]
     fn test_extract_text_preview_array_empty() {
@@ -3629,15 +3708,24 @@ mod tests {
     }
     #[test]
     fn test_extract_text_preview_object_with_query() {
-        assert_eq!(extract_text_preview(&json!({"query": "search term"})), Some("search term".into()));
+        assert_eq!(
+            extract_text_preview(&json!({"query": "search term"})),
+            Some("search term".into())
+        );
     }
     #[test]
     fn test_extract_text_preview_object_with_url() {
-        assert_eq!(extract_text_preview(&json!({"url": "https://example.com"})), Some("https://example.com".into()));
+        assert_eq!(
+            extract_text_preview(&json!({"url": "https://example.com"})),
+            Some("https://example.com".into())
+        );
     }
     #[test]
     fn test_extract_text_preview_object_with_nested_content() {
-        assert_eq!(extract_text_preview(&json!({"content": "nested text"})), Some("nested text".into()));
+        assert_eq!(
+            extract_text_preview(&json!({"content": "nested text"})),
+            Some("nested text".into())
+        );
     }
     #[test]
     fn test_extract_text_preview_number() {
@@ -3699,7 +3787,9 @@ mod tests {
     fn test_parse_claude_content_blocks_non_array_value() {
         let blocks = parse_claude_content_blocks(&json!("just a string"), "user");
         assert_eq!(blocks.len(), 1);
-        let ClaudeContentBlock::Text { text, .. } = &blocks[0] else { panic!("expected text block") };
+        let ClaudeContentBlock::Text { text, .. } = &blocks[0] else {
+            panic!("expected text block")
+        };
         assert!(text.contains("Unsupported Claude content block: text"));
     }
     #[test]
@@ -3714,13 +3804,15 @@ mod tests {
     }
     #[test]
     fn test_parse_claude_content_blocks_array_with_malformed_block() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let blocks = parse_claude_content_blocks(
             &json!([{"type": "unknown_type", "data": "test"}]),
             "assistant",
         );
         assert_eq!(blocks.len(), 1);
-        let ClaudeContentBlock::Text { text, .. } = &blocks[0] else { panic!("expected text fallback block") };
+        let ClaudeContentBlock::Text { text, .. } = &blocks[0] else {
+            panic!("expected text fallback block")
+        };
         assert!(text.contains("Unsupported Claude content block: unknown_type"));
     }
 
@@ -3729,28 +3821,34 @@ mod tests {
     // ========================================================================
     #[test]
     fn test_normalize_reasoning_effort_none() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(None), None);
     }
     #[test]
     fn test_normalize_reasoning_effort_empty() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(Some("")), None);
     }
     #[test]
     fn test_normalize_reasoning_effort_whitespace() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         assert_eq!(normalize_reasoning_effort(Some("   ")), None);
     }
     #[test]
     fn test_normalize_reasoning_effort_uppercase() {
-            crate::test_log::init_test_logger();
-        assert_eq!(normalize_reasoning_effort(Some("HIGH")), Some("high".into()));
+        crate::test_log::init_test_logger();
+        assert_eq!(
+            normalize_reasoning_effort(Some("HIGH")),
+            Some("high".into())
+        );
     }
     #[test]
     fn test_normalize_reasoning_effort_with_spaces() {
-            crate::test_log::init_test_logger();
-        assert_eq!(normalize_reasoning_effort(Some("  medium  ")), Some("medium".into()));
+        crate::test_log::init_test_logger();
+        assert_eq!(
+            normalize_reasoning_effort(Some("  medium  ")),
+            Some("medium".into())
+        );
     }
 
     // ========================================================================
@@ -3758,38 +3856,44 @@ mod tests {
     // ========================================================================
     #[test]
     fn test_default_document_filename_pdf() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("application/pdf"), "document.pdf");
     }
     #[test]
     fn test_default_document_filename_text() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("text/plain"), "document.txt");
     }
     #[test]
     fn test_default_document_filename_markdown() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("text/markdown"), "document.md");
     }
     #[test]
     fn test_default_document_filename_json() {
-            crate::test_log::init_test_logger();
-        assert_eq!(default_document_filename("application/json"), "document.json");
+        crate::test_log::init_test_logger();
+        assert_eq!(
+            default_document_filename("application/json"),
+            "document.json"
+        );
     }
     #[test]
     fn test_default_document_filename_custom() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         assert_eq!(default_document_filename("image/png"), "document.png");
     }
     #[test]
     fn test_default_document_filename_unknown_with_slash() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // "application/x-custom" → rsplit('/') gives "x-custom" → filter alphanumeric gives "xcustom"
-        assert_eq!(default_document_filename("application/x-custom"), "document.xcustom");
+        assert_eq!(
+            default_document_filename("application/x-custom"),
+            "document.xcustom"
+        );
     }
     #[test]
     fn test_default_document_filename_no_slash() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // "unknown" has no slash → falls back to "bin" extension
         assert_eq!(default_document_filename("unknown"), "document.bin");
     }
@@ -3813,7 +3917,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3833,7 +3939,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -3849,7 +3957,9 @@ mod tests {
             "max_tokens": 0,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3865,7 +3975,9 @@ mod tests {
             "max_tokens": 100_001,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3884,7 +3996,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3893,43 +4007,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_anthropic_oauth_token_rejected() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"),
+        );
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), headers, axum::Json(request)).await.unwrap();
+        let response = messages(State(app), headers, axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(parsed["error"]["type"], "authentication_error");
-        assert!(parsed["error"]["message"].as_str().unwrap().contains("Anthropic OAuth"));
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Anthropic OAuth"));
     }
 
     #[tokio::test]
     async fn test_messages_streaming_anthropic_oauth_token_rejected() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-ant-test12345678901234567890"),
+        );
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 32,
             "stream": true
         }));
-        let error = messages(State(app), headers, axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), headers, axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn test_messages_streaming_empty_messages_returns_error_tuple() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -3937,13 +4064,15 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn test_messages_streaming_too_many_messages_returns_error_tuple() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let msgs: Vec<Value> = (0..100_001)
             .map(|_| json!({"role": "user", "content": "x"}))
@@ -3954,13 +4083,15 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn test_messages_streaming_content_too_large_returns_error_tuple() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let big_data = "x".repeat(5 * 1024 * 1024 + 100);
         let content = json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": big_data}}]);
@@ -3970,13 +4101,15 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
     async fn test_messages_streaming_invalid_max_tokens_returns_error_tuple() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -3984,13 +4117,15 @@ mod tests {
             "max_tokens": 0,
             "stream": true
         }));
-        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn test_messages_system_prompt_with_cache_control() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4000,7 +4135,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, _) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         let captured = captured.read().await;
@@ -4009,7 +4146,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_service_tier_accepted() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4019,21 +4156,24 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         assert!(!captured.is_empty());
     }
 
     #[tokio::test]
     async fn test_messages_streaming_non_retryable_non_streaming_error() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::FORBIDDEN,
             "application/json",
             json!({"error": {"message": "forbidden"}}).to_string(),
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -4041,7 +4181,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -4050,14 +4192,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_backend_500_retryable_stream() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::INTERNAL_SERVER_ERROR,
             "application/json",
             json!({"error": {"message": "internal"}}).to_string(),
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -4065,20 +4208,23 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
     async fn test_messages_streaming_backend_502_retryable_stream() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::BAD_GATEWAY,
             "application/json",
             json!({"error": {"message": "bad gateway"}}).to_string(),
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -4086,20 +4232,23 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn test_messages_streaming_backend_504_retryable_stream() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let backend_url = spawn_static_backend(
             StatusCode::GATEWAY_TIMEOUT,
             "application/json",
             json!({"error": {"message": "timeout"}}).to_string(),
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -4107,13 +4256,15 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let error = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap_err();
+        let error = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[tokio::test]
     async fn test_messages_non_streaming_404_with_empty_models_list() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // When 404 but models list is empty, should fall through to generic error
         let backend_url = spawn_static_backend(
             StatusCode::NOT_FOUND,
@@ -4121,7 +4272,8 @@ mod tests {
             json!({"error": {"message": "not found"}}).to_string(),
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "missing-model",
@@ -4129,7 +4281,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -4138,7 +4292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_404_with_empty_models_list() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // When 404 but models list is empty, falls through to generic error stream
         let backend_url = spawn_static_backend(
             StatusCode::NOT_FOUND,
@@ -4146,7 +4300,8 @@ mod tests {
             json!({"error": {"message": "not found"}}).to_string(),
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "missing-model",
@@ -4154,7 +4309,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("event: message_stop"));
@@ -4162,7 +4319,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_unexpected_content_type_warning() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Backend returns text/html — should log warning but still process
         let backend_url = spawn_static_backend(
             StatusCode::OK,
@@ -4178,7 +4335,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         // Should still produce SSE output despite unexpected content type
@@ -4187,7 +4346,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_image_content_block() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4202,17 +4361,22 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let content = captured[0]["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
-        assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,iVBOR"));
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,iVBOR"));
     }
 
     #[tokio::test]
     async fn test_messages_with_document_missing_media_type() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4226,7 +4390,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let content = captured[0]["messages"][0]["content"].as_str().unwrap();
         // Should degrade to text placeholder for missing media_type/data
@@ -4235,7 +4401,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_document_file_missing_file_id() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4249,7 +4415,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let content = captured[0]["messages"][0]["content"].as_str().unwrap();
         assert!(content.contains("missing file_id"));
@@ -4257,7 +4425,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_document_unknown_source_type() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4271,7 +4439,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let content = captured[0]["messages"][0]["content"].as_str().unwrap();
         assert!(content.contains("source_type=s3"));
@@ -4279,7 +4449,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_removes_empty_assistant_placeholder() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4291,7 +4461,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let msgs = captured[0]["messages"].as_array().unwrap();
         // The empty assistant placeholder should have been removed
@@ -4301,7 +4473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_with_system_prompt_string() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -4311,7 +4483,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let msgs = captured[0]["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
@@ -4320,7 +4494,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_non_streaming_empty_response_content() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Backend returns a response with no content — should get empty text block
         let body = json!({
             "id": "chatcmpl-empty",
@@ -4335,7 +4509,8 @@ mod tests {
             body,
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -4343,7 +4518,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (_, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         // Should have at least one content block (empty text)
@@ -4353,7 +4530,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_default_stream_is_true() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // When stream field is omitted, it defaults to true (streaming)
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -4361,7 +4538,9 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 32
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         // Streaming response should contain SSE events
@@ -4370,7 +4549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_reasoning_model() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Test streaming with a reasoning model to cover reasoning delta path
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -4379,7 +4558,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("event: message_start"));
@@ -4388,7 +4569,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_tools() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Test streaming with tools to cover tool call delta path
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -4402,7 +4583,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("event: message_stop"));
@@ -4417,9 +4600,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!close_thinking_block_if_open(&tx, &mut state, "test").await);
         assert!(state.thinking_open);
@@ -4429,9 +4618,15 @@ mod tests {
     async fn test_close_thinking_block_noop_when_closed() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(close_thinking_block_if_open(&tx, &mut state, "test").await);
     }
@@ -4441,9 +4636,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: true, text_index: 0, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: true,
+            text_index: 0,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!close_text_block_if_open(&tx, &mut state).await);
     }
@@ -4452,9 +4653,15 @@ mod tests {
     async fn test_close_text_block_noop_when_closed() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(close_text_block_if_open(&tx, &mut state).await);
     }
@@ -4463,9 +4670,15 @@ mod tests {
     async fn test_stream_reasoning_delta_empty_returns_true() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(stream_reasoning_delta(&tx, &mut state, "").await);
     }
@@ -4475,9 +4688,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!stream_reasoning_delta(&tx, &mut state, "thinking...").await);
     }
@@ -4487,9 +4706,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!stream_reasoning_delta(&tx, &mut state, "more thinking").await);
     }
@@ -4498,9 +4723,15 @@ mod tests {
     async fn test_stream_text_delta_empty_returns_true() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(1);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(stream_text_delta(&tx, &mut state, "").await);
     }
@@ -4510,9 +4741,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!stream_text_delta(&tx, &mut state, "hello").await);
     }
@@ -4522,9 +4759,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: true, text_index: 0, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: true,
+            text_index: 0,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!stream_text_delta(&tx, &mut state, "more text").await);
     }
@@ -4534,9 +4777,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 1, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 1,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!stream_text_delta(&tx, &mut state, "hello").await);
     }
@@ -4546,11 +4795,19 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 1, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 1,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
-        assert!(!stream_tool_call_piece(&tx, &mut state, 0, Some("id"), Some("name"), Some("{}")).await);
+        assert!(
+            !stream_tool_call_piece(&tx, &mut state, 0, Some("id"), Some("name"), Some("{}")).await
+        );
     }
 
     #[tokio::test]
@@ -4558,20 +4815,34 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 1, thinking_open: false, thinking_index: -1,
-            text_open: true, text_index: 0, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 1,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: true,
+            text_index: 0,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
-        assert!(!stream_tool_call_piece(&tx, &mut state, 0, Some("id"), Some("name"), Some("{}")).await);
+        assert!(
+            !stream_tool_call_piece(&tx, &mut state, 0, Some("id"), Some("name"), Some("{}")).await
+        );
     }
 
     #[tokio::test]
     async fn test_stream_tool_call_piece_no_id_returns_true() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(4);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // No id or name → should return true without sending start
         assert!(stream_tool_call_piece(&tx, &mut state, 0, None, None, Some("{}")).await);
@@ -4582,11 +4853,20 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
-        assert!(!stream_tool_call_piece(&tx, &mut state, 0, Some("id1"), Some("tool"), Some("{}")).await);
+        assert!(
+            !stream_tool_call_piece(&tx, &mut state, 0, Some("id1"), Some("tool"), Some("{}"))
+                .await
+        );
     }
 
     #[tokio::test]
@@ -4594,15 +4874,27 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 1, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 1,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Pre-populate tools map so start was already sent
-        state.tools.insert(0, ToolBuf {
-            block_index: 0, id: Some("id1".into()), name: Some("tool".into()),
-            pending_args: String::new(), has_sent_start: true,
-        });
+        state.tools.insert(
+            0,
+            ToolBuf {
+                block_index: 0,
+                id: Some("id1".into()),
+                name: Some("tool".into()),
+                pending_args: String::new(),
+                has_sent_start: true,
+            },
+        );
         assert!(!stream_tool_call_piece(&tx, &mut state, 0, None, None, Some("args")).await);
     }
 
@@ -4610,11 +4902,27 @@ mod tests {
     async fn test_stream_tool_call_piece_success_with_id_and_name() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(4);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
-        assert!(stream_tool_call_piece(&tx, &mut state, 0, Some("call_1"), Some("read_file"), Some("{}")).await);
+        assert!(
+            stream_tool_call_piece(
+                &tx,
+                &mut state,
+                0,
+                Some("call_1"),
+                Some("read_file"),
+                Some("{}")
+            )
+            .await
+        );
         // Should have sent content_block_start and content_block_delta
         let ev1 = rx.recv().await.unwrap();
         assert!(format!("{:?}", ev1).contains("content_block_start"));
@@ -4627,9 +4935,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!emit_backend_error_text(&tx, &mut state, "error", "raw").await);
     }
@@ -4638,9 +4952,15 @@ mod tests {
     async fn test_emit_backend_error_text_success() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(emit_backend_error_text(&tx, &mut state, "test error", "raw").await);
         assert_eq!(state.final_stop_reason, "error");
@@ -4670,9 +4990,15 @@ mod tests {
     #[tokio::test]
     async fn test_add_output_tokens_no_increment_when_backend_reported() {
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 42, backend_reported_usage: true,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 42,
+            backend_reported_usage: true,
         };
         add_output_tokens(&mut state, "some text");
         assert_eq!(state.output_token_count, 42); // unchanged
@@ -4681,9 +5007,15 @@ mod tests {
     #[tokio::test]
     async fn test_add_output_tokens_increments_when_not_reported() {
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         add_output_tokens(&mut state, "abcdefgh"); // 8 bytes / 4 = 2 tokens
         assert_eq!(state.output_token_count, 2);
@@ -4692,9 +5024,15 @@ mod tests {
     #[tokio::test]
     async fn test_add_output_tokens_minimum_one_token() {
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         add_output_tokens(&mut state, "a"); // 1 byte / 4 = 0, but max(1, 0) = 1
         assert_eq!(state.output_token_count, 1);
@@ -4708,31 +5046,55 @@ mod tests {
     async fn test_process_backend_sse_payload_done_marker() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
-        assert!(matches!(process_backend_sse_payload(&tx, &mut state, "[DONE]").await, StreamPayloadOutcome::Done));
+        assert!(matches!(
+            process_backend_sse_payload(&tx, &mut state, "[DONE]").await,
+            StreamPayloadOutcome::Done
+        ));
     }
 
     #[tokio::test]
     async fn test_process_backend_sse_payload_empty_data() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
-        assert!(matches!(process_backend_sse_payload(&tx, &mut state, "").await, StreamPayloadOutcome::Continue));
+        assert!(matches!(
+            process_backend_sse_payload(&tx, &mut state, "").await,
+            StreamPayloadOutcome::Continue
+        ));
     }
 
     #[tokio::test]
     async fn test_process_backend_sse_payload_invalid_json_object() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // A valid JSON object but not an OAIStreamChunk — should log warning and continue
         let result = process_backend_sse_payload(&tx, &mut state, "{\"unexpected\": true}").await;
@@ -4743,9 +5105,15 @@ mod tests {
     async fn test_process_backend_sse_payload_invalid_json_text() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Not JSON at all — should log warning and continue
         let result = process_backend_sse_payload(&tx, &mut state, "not json at all").await;
@@ -4756,9 +5124,15 @@ mod tests {
     async fn test_process_backend_sse_payload_error_in_chunk() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Error object in the SSE data (not a valid OAIStreamChunk)
         let error_data = r#"{"error":{"message":"test error message","type":"test_error"}}"#;
@@ -4771,9 +5145,15 @@ mod tests {
     async fn test_process_backend_sse_payload_error_in_chunk_empty_message() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Error object with empty message — should use the full error JSON
         let error_data = r#"{"error":{"message":"","type":"test_error"}}"#;
@@ -4786,9 +5166,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Error in chunk, but receiver is dropped → ClientDisconnected
         let error_data = r#"{"error":{"message":"test error"}}"#;
@@ -4800,15 +5186,22 @@ mod tests {
     async fn test_process_backend_sse_payload_error_in_chunk_struct() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Valid OAIStreamChunk with error field
         let error_chunk = serde_json::json!({
             "choices": [],
             "error": {"message": "backend error in chunk", "type": "server_error"}
-        }).to_string();
+        })
+        .to_string();
         let result = process_backend_sse_payload(&tx, &mut state, &error_chunk).await;
         assert!(matches!(result, StreamPayloadOutcome::FatalError));
         assert_eq!(state.final_stop_reason, "error");
@@ -4818,9 +5211,15 @@ mod tests {
     async fn test_process_backend_sse_payload_no_choices() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({"choices": []}).to_string();
         let result = process_backend_sse_payload(&tx, &mut state, &chunk).await;
@@ -4831,9 +5230,15 @@ mod tests {
     async fn test_process_backend_sse_payload_no_delta_no_message() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({"choices": [{"index": 0}]}).to_string();
         let result = process_backend_sse_payload(&tx, &mut state, &chunk).await;
@@ -4844,13 +5249,20 @@ mod tests {
     async fn test_process_backend_sse_payload_finish_reason_updates_stop_reason() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({
             "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
-        }).to_string();
+        })
+        .to_string();
         process_backend_sse_payload(&tx, &mut state, &chunk).await;
         assert_eq!(state.final_stop_reason, "max_tokens");
     }
@@ -4859,14 +5271,21 @@ mod tests {
     async fn test_process_backend_sse_payload_usage_updates_token_count() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({
             "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
             "usage": {"prompt_tokens": 15, "completion_tokens": 25, "total_tokens": 40}
-        }).to_string();
+        })
+        .to_string();
         process_backend_sse_payload(&tx, &mut state, &chunk).await;
         assert_eq!(state.output_token_count, 25);
         assert!(state.backend_reported_usage);
@@ -4880,9 +5299,15 @@ mod tests {
     async fn test_process_choice_message_with_text_content() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({"role": "assistant", "content": "hello world"});
         assert!(process_choice_message(&tx, &mut state, &message).await);
@@ -4894,9 +5319,15 @@ mod tests {
     async fn test_process_choice_message_with_reasoning_content() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({"role": "assistant", "reasoning_content": "thinking about it", "content": "answer"});
         assert!(process_choice_message(&tx, &mut state, &message).await);
@@ -4906,16 +5337,24 @@ mod tests {
             evs.push(ev);
         }
         assert!(evs.iter().any(|e| format!("{:?}", e).contains("thinking")));
-        assert!(evs.iter().any(|e| format!("{:?}", e).contains("text_delta")));
+        assert!(evs
+            .iter()
+            .any(|e| format!("{:?}", e).contains("text_delta")));
     }
 
     #[tokio::test]
     async fn test_process_choice_message_with_tool_calls() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({
             "role": "assistant",
@@ -4931,9 +5370,15 @@ mod tests {
     async fn test_process_choice_message_with_content_array() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({"role": "assistant", "content": [{"type": "text", "text": "part1"}, {"type": "text", "text": "part2"}]});
         assert!(process_choice_message(&tx, &mut state, &message).await);
@@ -4943,13 +5388,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_choice_message_disconnect() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({"role": "assistant", "content": "hello"});
         assert!(!process_choice_message(&tx, &mut state, &message).await);
@@ -4961,12 +5412,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_tool_call_value_with_index() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let tool_call = json!({"index": 0, "id": "call_1", "function": {"name": "test_tool", "arguments": "{}"}});
         assert!(stream_tool_call_value(&tx, &mut state, 0, &tool_call).await);
@@ -4976,15 +5433,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_tool_call_value_default_index() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // No index field — should use default_idx
-        let tool_call = json!({"id": "call_1", "function": {"name": "test_tool", "arguments": "{}"}});
+        let tool_call =
+            json!({"id": "call_1", "function": {"name": "test_tool", "arguments": "{}"}});
         assert!(stream_tool_call_value(&tx, &mut state, 5, &tool_call).await);
         let ev = rx.recv().await.unwrap();
         assert!(format!("{:?}", ev).contains("content_block_start"));
@@ -4996,7 +5460,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_non_streaming_response_in_sse() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Backend returns a complete non-streaming response inside an SSE chunk
         let body = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -5018,7 +5482,8 @@ mod tests {
             body,
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -5026,7 +5491,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("Complete response"));
@@ -5035,7 +5502,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_error_in_sse_chunk() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Backend returns an error in an SSE chunk
         let body = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -5049,7 +5516,8 @@ mod tests {
             body,
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -5057,7 +5525,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("rate limit exceeded"));
@@ -5066,7 +5536,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_streaming_with_non_streaming_response_and_tool_calls() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Backend returns a complete non-streaming response with tool calls in SSE
         let body = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -5092,7 +5562,8 @@ mod tests {
             body,
             StatusCode::OK,
             json!({"data": []}),
-        ).await;
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -5100,7 +5571,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("tool_use"));
@@ -5116,9 +5589,15 @@ mod tests {
     async fn test_stream_tool_call_delta_with_function() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let tool_call = crate::models::OAIToolCallDelta {
             index: Some(0),
@@ -5138,9 +5617,15 @@ mod tests {
     async fn test_stream_tool_call_delta_default_index() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let tool_call = crate::models::OAIToolCallDelta {
             index: None,
@@ -5152,8 +5637,6 @@ mod tests {
         assert!(stream_tool_call_delta(&tx, &mut state, &tool_call).await);
     }
 
-
-
     // ========================================================================
     // Success paths for streaming functions (blocks open + send succeeds)
     // ========================================================================
@@ -5162,9 +5645,15 @@ mod tests {
     async fn test_close_thinking_block_success() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(close_thinking_block_if_open(&tx, &mut state, "success test").await);
         assert!(!state.thinking_open);
@@ -5176,9 +5665,15 @@ mod tests {
     async fn test_close_text_block_success() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: true, text_index: 0, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: true,
+            text_index: 0,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(close_text_block_if_open(&tx, &mut state).await);
         assert!(!state.text_open);
@@ -5190,9 +5685,15 @@ mod tests {
     async fn test_stream_reasoning_delta_success() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(stream_reasoning_delta(&tx, &mut state, "reasoning text").await);
         assert!(state.thinking_open);
@@ -5209,9 +5710,15 @@ mod tests {
     async fn test_stream_reasoning_delta_second_delta_with_open_block() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 1, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 1,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(stream_reasoning_delta(&tx, &mut state, "more reasoning").await);
         let ev = rx.recv().await.unwrap();
@@ -5222,9 +5729,15 @@ mod tests {
     async fn test_stream_text_delta_success() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(stream_text_delta(&tx, &mut state, "hello world").await);
         assert!(state.text_open);
@@ -5240,9 +5753,15 @@ mod tests {
     async fn test_stream_text_delta_with_reasoning_open_closes_thinking_first() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 1, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 1,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(stream_text_delta(&tx, &mut state, "hello").await);
         assert!(!state.thinking_open);
@@ -5256,9 +5775,15 @@ mod tests {
     async fn test_emit_backend_error_text_with_open_blocks() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
         let mut state = StreamState {
-            next_block_index: 2, thinking_open: true, thinking_index: 0,
-            text_open: true, text_index: 1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 2,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: true,
+            text_index: 1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(emit_backend_error_text(&tx, &mut state, "error msg", "raw data").await);
         assert!(!state.thinking_open);
@@ -5267,7 +5792,7 @@ mod tests {
         // Should close thinking, close text, then emit error block
         let _ev1 = rx.recv().await.unwrap(); // thinking close
         let _ev2 = rx.recv().await.unwrap(); // text close
-        let ev3 = rx.recv().await.unwrap();  // error start
+        let ev3 = rx.recv().await.unwrap(); // error start
         assert!(format!("{:?}", ev3).contains("content_block_start"));
     }
 
@@ -5276,9 +5801,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Send enough to pass the start but fail on the delta
         // Actually, with the receiver dropped, the first send fails
@@ -5290,9 +5821,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(2);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!emit_backend_error_text(&tx, &mut state, "error", "raw").await);
     }
@@ -5305,9 +5842,15 @@ mod tests {
     async fn test_process_sse_payload_invalid_chunk_with_error_field() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // choices has wrong type (string instead of array) → OAIStreamChunk deserialization fails
         // but the data IS a valid JSON object with an error field
@@ -5321,9 +5864,15 @@ mod tests {
     async fn test_process_sse_payload_invalid_chunk_with_empty_error_message() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Empty error message → uses full error JSON as error_details
         let data = r#"{"choices":"invalid","error":{"message":"","type":"test"}}"#;
@@ -5335,9 +5884,15 @@ mod tests {
     async fn test_process_sse_payload_invalid_chunk_object_without_error() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Invalid OAIStreamChunk (choices is wrong type) but valid JSON object without error
         let data = r#"{"choices":"invalid","something":"else"}"#;
@@ -5350,9 +5905,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let data = r#"{"choices":"invalid","error":{"message":"err"}}"#;
         let result = process_backend_sse_payload(&tx, &mut state, data).await;
@@ -5363,9 +5924,15 @@ mod tests {
     async fn test_process_sse_payload_invalid_chunk_long_data_without_error() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         // Long invalid JSON that fails OAIStreamChunk deserialization
         let long_data = format!(r#"{{"choices":"invalid","data":"{}"}}"#, "x".repeat(600));
@@ -5382,9 +5949,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({"role": "assistant", "reasoning_content": "thinking"});
         assert!(!process_choice_message(&tx, &mut state, &message).await);
@@ -5395,9 +5968,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({"role": "assistant", "content": "hello"});
         assert!(!process_choice_message(&tx, &mut state, &message).await);
@@ -5408,9 +5987,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let message = json!({"role": "assistant", "tool_calls": [{"index": 0, "id": "c1", "function": {"name": "t", "arguments": "{}"}}]});
         assert!(!process_choice_message(&tx, &mut state, &message).await);
@@ -5425,9 +6010,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({
             "choices": [{"index": 0, "delta": {"reasoning_content": "thinking"}, "finish_reason": null}]
@@ -5441,13 +6032,20 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({
             "choices": [{"index": 0, "delta": {"content": "text"}, "finish_reason": null}]
-        }).to_string();
+        })
+        .to_string();
         let result = process_backend_sse_payload(&tx, &mut state, &chunk).await;
         assert!(matches!(result, StreamPayloadOutcome::ClientDisconnected));
     }
@@ -5457,9 +6055,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({
             "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "t"}}]}, "finish_reason": null}]
@@ -5473,13 +6077,20 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let chunk = serde_json::json!({
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}}]
-        }).to_string();
+        })
+        .to_string();
         let result = process_backend_sse_payload(&tx, &mut state, &chunk).await;
         assert!(matches!(result, StreamPayloadOutcome::ClientDisconnected));
     }
@@ -5513,8 +6124,6 @@ mod tests {
         assert_eq!(blocks.len(), 1);
     }
 
-
-
     // ========================================================================
     // Log-enabled tests — cover log::warn!, log::debug!, log::info! calls
     // ========================================================================
@@ -5529,14 +6138,18 @@ mod tests {
         let app = test_app(spawn_mock_backend().await, false);
 
         // Too many messages — log::warn! at validation
-        let msgs: Vec<Value> = (0..100_001).map(|_| json!({"role": "user", "content": "x"})).collect();
+        let msgs: Vec<Value> = (0..100_001)
+            .map(|_| json!({"role": "user", "content": "x"}))
+            .collect();
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": msgs,
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app.clone()), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app.clone()), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(response).await;
 
         // Content too large — log::warn!
@@ -5547,7 +6160,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app.clone()), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app.clone()), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(response).await;
 
         // Invalid max_tokens — log::warn!
@@ -5557,7 +6172,9 @@ mod tests {
             "max_tokens": 0,
             "stream": false
         }));
-        let response = messages(State(app.clone()), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app.clone()), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(response).await;
 
         // System prompt too large — log::warn!
@@ -5569,7 +6186,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(response).await;
     }
 
@@ -5586,7 +6205,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         assert_eq!(status, StatusCode::OK);
         // Verify the streaming completed
@@ -5605,7 +6226,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(response).await;
 
         // Streaming connection failure
@@ -5629,9 +6252,13 @@ mod tests {
             json!({"error": {"message": "stream error", "type": "test"}})
         );
         let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body,
-            StatusCode::OK, json!({"data": []}),
-        ).await;
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({"data": []}),
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -5639,7 +6266,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(response).await;
     }
 
@@ -5655,7 +6284,9 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(response).await;
     }
 
@@ -5670,12 +6301,17 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(response).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(parsed["error"]["type"], "invalid_request_error");
-        assert!(parsed["error"]["message"].as_str().unwrap().contains("no usable messages"));
+        assert!(parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no usable messages"));
     }
 
     #[tokio::test]
@@ -5695,7 +6331,9 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         assert_eq!(captured[0]["thinking"]["type"], json!("enabled"));
     }
@@ -5715,7 +6353,9 @@ mod tests {
             }],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
         let captured = captured.read().await;
         assert!(!captured.is_empty());
@@ -5723,7 +6363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_messages_assistant_image_block_hits_catchall() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Line 1195: an assistant message containing an image block falls into
         // the assistant-match `_ => {}` catch-all (images are not handled for
         // assistant messages).
@@ -5740,10 +6380,15 @@ mod tests {
             ],
             "max_tokens": 32, "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let msgs = captured[0]["messages"].as_array().unwrap();
-        assert!(msgs[0]["content"].as_str().unwrap().contains("described it"));
+        assert!(msgs[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("described it"));
     }
 
     #[tokio::test]
@@ -5763,7 +6408,9 @@ mod tests {
             }],
             "max_tokens": 32, "stream": false
         }));
-        messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let captured = captured.read().await;
         let msgs = captured[0]["messages"].as_array().unwrap();
         assert!(msgs[0]["content"].as_str().unwrap().contains("hello"));
@@ -5794,7 +6441,9 @@ mod tests {
                 }),
             )
             .route("/v1/models", get(|| async { Json(json!({ "data": [] })) }));
-        tokio::spawn(async move { let _ = axum::serve(listener, router).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut app = test_app(format!("http://{addr}/v1/chat/completions"), false);
@@ -5804,7 +6453,9 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
         let host = received_host.read().await;
         assert_eq!(host.as_deref(), Some("custom.example.com"));
@@ -5828,7 +6479,9 @@ mod tests {
             }],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
     }
 
@@ -5858,12 +6511,16 @@ mod tests {
             let _ = sock
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
                 .await;
-            let _ = sock.write_all(format!("{:X}\r\n", first.len()).as_bytes()).await;
+            let _ = sock
+                .write_all(format!("{:X}\r\n", first.len()).as_bytes())
+                .await;
             let _ = sock.write_all(first.as_bytes()).await;
             let _ = sock.write_all(b"\r\n").await;
             let _ = sock.flush().await;
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            let _ = sock.write_all(format!("{:X}\r\n", second.len()).as_bytes()).await;
+            let _ = sock
+                .write_all(format!("{:X}\r\n", second.len()).as_bytes())
+                .await;
             let _ = sock.write_all(second.as_bytes()).await;
             let _ = sock.write_all(b"\r\n").await;
             let _ = sock.write_all(b"0\r\n\r\n").await;
@@ -5875,7 +6532,9 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
         assert!(b.contains("event: message_stop"));
@@ -5893,15 +6552,22 @@ mod tests {
             json!({ "error": { "type": "some_error_type" }, "choices": "not-an-array" })
         );
         let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
-        ).await;
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
         assert!(b.contains("some_error_type"));
@@ -5919,15 +6585,22 @@ mod tests {
             json!({ "id": "y", "object": "chat.completion.chunk", "model": "zai-org/GLM-4.5-Air", "usage": { "prompt_tokens": 1 }, "choices": "bad" })
         );
         let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
-        ).await;
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, _b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -5942,15 +6615,22 @@ mod tests {
             json!({ "error": { "type": "valid_error_type" }, "choices": [] })
         );
         let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
-        ).await;
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
         assert!(b.contains("valid_error_type"));
@@ -5966,15 +6646,22 @@ mod tests {
             json!({ "error": { "message": "", "code": 42 }, "choices": "bad" })
         );
         let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
-        ).await;
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, _b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -5990,15 +6677,22 @@ mod tests {
             json!({ "id": "x", "choices": "bad", "payload": big })
         );
         let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
-        ).await;
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, _b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -6023,7 +6717,9 @@ mod tests {
             }],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
     }
 
@@ -6041,7 +6737,9 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let response = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let response = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         // Drop the response without consuming the body → receiver dropped.
         drop(response);
         // Let the spawned streaming task run and hit the failed send.
@@ -6056,15 +6754,22 @@ mod tests {
         let garbage = "x".repeat(600);
         let body = format!("data: {}\n\ndata: [DONE]\n\n", garbage);
         let backend_url = spawn_static_backend(
-            StatusCode::OK, "text/event-stream", body, StatusCode::OK, json!({ "data": [] }),
-        ).await;
+            StatusCode::OK,
+            "text/event-stream",
+            body,
+            StatusCode::OK,
+            json!({ "data": [] }),
+        )
+        .await;
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, _b) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -6090,7 +6795,9 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n")
                 .await;
             let partial = b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
-            let _ = sock.write_all(format!("{:X}\r\n", partial.len()).as_bytes()).await;
+            let _ = sock
+                .write_all(format!("{:X}\r\n", partial.len()).as_bytes())
+                .await;
             let _ = sock.write_all(partial).await;
             let _ = sock.write_all(b"\r\n").await;
             let _ = sock.flush().await;
@@ -6104,7 +6811,9 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 32, "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, _b) = response_text(r).await;
         // The stream still completes (the handler closes blocks and finishes)
         assert_eq!(status, StatusCode::OK);
@@ -6116,7 +6825,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conv_assistant_thinking_covers_three_false_branches() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Lines 1172 (signature None), 1218 (no redacted), 1230 (no text):
         // a single thinking block with no signature, no text, no redacted thinking.
         let app = test_app(spawn_mock_backend().await, false);
@@ -6128,13 +6837,15 @@ mod tests {
             ],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
     }
 
     #[tokio::test]
     async fn test_conv_assistant_redacted_thinking_only() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Line 1213: assistant with only redacted_thinking → thinking_parts empty.
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -6145,13 +6856,15 @@ mod tests {
             ],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
     }
 
     #[tokio::test]
     async fn test_conv_user_tool_result_without_text() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Line 1154: user tool_result with no text blocks → text_parts empty.
         let app = test_app(spawn_mock_backend().await, false);
         let request = request_from_value(json!({
@@ -6162,7 +6875,9 @@ mod tests {
             }],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
     }
 
@@ -6179,7 +6894,9 @@ mod tests {
             ],
             "max_tokens": 32, "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
     }
 
@@ -6195,7 +6912,9 @@ mod tests {
             "stop_sequences": ["a", "b", "c", "d", "e"],
             "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
         let captured = captured.read().await;
         assert_eq!(captured[0]["stop"].as_array().unwrap().len(), 4);
@@ -6212,7 +6931,9 @@ mod tests {
     #[test]
     fn test_unsupported_content_block_text_includes_preview() {
         // Line 265: an unsupported block with a text preview → preview appended.
-        let text = unsupported_content_block_text(&json!({"type": "custom", "text": "a meaningful preview"}));
+        let text = unsupported_content_block_text(
+            &json!({"type": "custom", "text": "a meaningful preview"}),
+        );
         assert!(text.contains("[Unsupported Claude content block: custom]"));
         assert!(text.contains("a meaningful preview"));
     }
@@ -6224,14 +6945,21 @@ mod tests {
         // Line 828: usage with completion_tokens but no prompt_tokens → false branch.
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let data = serde_json::to_string(&json!({
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             "usage": {"completion_tokens": 7}
-        })).unwrap();
+        }))
+        .unwrap();
         let outcome = process_backend_sse_payload(&tx, &mut state, &data).await;
         assert!(matches!(outcome, StreamPayloadOutcome::Continue));
         assert_eq!(state.output_token_count, 7);
@@ -6244,14 +6972,21 @@ mod tests {
         crate::test_log::init_test_logger();
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let data = serde_json::to_string(&json!({
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 5}
-        })).unwrap();
+        }))
+        .unwrap();
         let outcome = process_backend_sse_payload(&tx, &mut state, &data).await;
         assert!(matches!(outcome, StreamPayloadOutcome::Continue));
         assert!(!state.backend_reported_usage);
@@ -6265,9 +7000,15 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: true, text_index: 0, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: true,
+            text_index: 0,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!stream_reasoning_delta(&tx, &mut state, "thinking...").await);
     }
@@ -6278,23 +7019,35 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: true, thinking_index: 0,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: true,
+            thinking_index: 0,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
     }
 
     #[tokio::test]
     async fn test_emit_backend_error_text_disconnect_on_close_text() {
-            crate::test_log::init_test_logger();
+        crate::test_log::init_test_logger();
         // Line 651: text_open=true (thinking closed) + dropped rx → close_text fails.
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         drop(rx);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: true, text_index: 0, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: true,
+            text_index: 0,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
     }
@@ -6303,7 +7056,12 @@ mod tests {
     // With capacity 1, the sender's second send blocks when the buffer is full,
     // yielding to the receiver — this makes the (n+1)th send deterministically
     // fail after the receiver drops (the receiver runs while the sender blocks).
-    async fn recv_n_then_drop(n: usize) -> (tokio::sync::mpsc::Sender<Event>, tokio::task::JoinHandle<()>) {
+    async fn recv_n_then_drop(
+        n: usize,
+    ) -> (
+        tokio::sync::mpsc::Sender<Event>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         let handle = tokio::spawn(async move {
             let mut rx = rx;
@@ -6323,9 +7081,15 @@ mod tests {
         // the content_block_delta send fails → "Client disconnected during error delta".
         let (tx, handle) = recv_n_then_drop(1).await;
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
         handle.await.unwrap();
@@ -6337,14 +7101,19 @@ mod tests {
         // the content_block_stop send fails → "Client disconnected during error stop".
         let (tx, handle) = recv_n_then_drop(2).await;
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         assert!(!emit_backend_error_text(&tx, &mut state, "err", "raw").await);
         handle.await.unwrap();
     }
-
 
     #[test]
     fn test_unsupported_content_block_text_empty_preview_skips_append() {
@@ -6368,7 +7137,9 @@ mod tests {
             "stop_sequences": ["only", "two"],
             "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let _ = response_text(r).await;
         let captured = captured.read().await;
         assert_eq!(captured[0]["stop"].as_array().unwrap().len(), 2);
@@ -6392,7 +7163,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
         // The proxy emits a Claude Messages SSE stream.
@@ -6413,8 +7186,8 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_drains_trailing_bytes_after_done() {
         crate::test_log::init_test_logger();
-        use futures::stream;
         use axum::body::Body;
+        use futures::stream;
 
         let models_body = json!({ "data": [] });
         let app = Router::new()
@@ -6458,11 +7231,16 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         let backend_url = format!("http://{addr}/v1/chat/completions");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Warm up the models endpoint (also exercises the models handler).
-        let _ = reqwest::Client::new().get(format!("http://{addr}/v1/models")).send().await;
+        let _ = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await;
 
         let app = test_app(backend_url, false);
         let request = request_from_value(json!({
@@ -6471,7 +7249,9 @@ mod tests {
             "max_tokens": 32,
             "stream": true
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, body) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("event: message_stop"));
@@ -6509,20 +7289,24 @@ mod tests {
                 let body = body.clone();
                 async move {
                     let mut resp = Response::new(Body::from(body));
-                    resp.headers_mut().insert(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("text/event-stream"),
-                    );
+                    resp.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
                     resp
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
-        client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap()
+        client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap()
     }
 
     // disconnect before ping: receiver consumes 1 event (message_start) then
@@ -6577,26 +7361,29 @@ mod tests {
                 let body = body.clone();
                 async move {
                     let mut resp = Response::new(Body::from(body));
-                    resp.headers_mut().insert(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("text/event-stream"),
-                    );
+                    resp.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
                     resp
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
-        let res = client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap();
+        let res = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap();
         let (tx, handle) = recv_n_then_drop(2).await;
         let cb = make_circuit_breaker();
         run_streaming_task(tx, res, "zai-org/GLM-4.5-Air".into(), 5, cb).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
-
 
     // ClientDisconnected in the flush path (line 1003): a backend that sends
     // an error chunk WITHOUT a trailing blank line → the SSE parser buffers it,
@@ -6609,27 +7396,31 @@ mod tests {
         use axum::body::Body;
         // Error chunk with NO trailing \n\n — stays buffered in the SSE parser.
         let err_chunk = json!({ "error": { "message": "flush boom" } });
-        let body = format!("data: {err_chunk}");  // no trailing \n\n
+        let body = format!("data: {err_chunk}"); // no trailing \n\n
         let app = Router::new().route(
             "/v1/chat/completions",
             post(move || {
                 let body = body.clone();
                 async move {
                     let mut resp = Response::new(Body::from(body));
-                    resp.headers_mut().insert(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("text/event-stream"),
-                    );
+                    resp.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
                     resp
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
-        let res = client.post(format!("http://{addr}/v1/chat/completions")).send().await.unwrap();
+        let res = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap();
         // Consume message_start + ping (2 events), then drop → the flush
         // error-text send fails → ClientDisconnected.
         let (tx, handle) = recv_n_then_drop(2).await;
@@ -6648,9 +7439,15 @@ mod tests {
     async fn test_process_sse_payload_non_object_json_array() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let result = process_backend_sse_payload(&tx, &mut state, "[1,2,3]").await;
         assert!(matches!(result, StreamPayloadOutcome::Continue));
@@ -6660,9 +7457,15 @@ mod tests {
     async fn test_process_sse_payload_non_object_json_number() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Event>(8);
         let mut state = StreamState {
-            next_block_index: 0, thinking_open: false, thinking_index: -1,
-            text_open: false, text_index: -1, tools: HashMap::new(),
-            final_stop_reason: "end_turn", output_token_count: 0, backend_reported_usage: false,
+            next_block_index: 0,
+            thinking_open: false,
+            thinking_index: -1,
+            text_open: false,
+            text_index: -1,
+            tools: HashMap::new(),
+            final_stop_reason: "end_turn",
+            output_token_count: 0,
+            backend_reported_usage: false,
         };
         let result = process_backend_sse_payload(&tx, &mut state, "42").await;
         assert!(matches!(result, StreamPayloadOutcome::Continue));
@@ -6715,23 +7518,24 @@ mod tests {
                 async move {
                     // Yield chunk1 immediately, then chunk2 after a delay so
                     // reqwest cannot coalesce them into one bytes_stream item.
-                    let s = stream::iter(vec![Ok::<_, std::convert::Infallible>(c1)])
-                        .chain(stream::once(async move {
+                    let s = stream::iter(vec![Ok::<_, std::convert::Infallible>(c1)]).chain(
+                        stream::once(async move {
                             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                             Ok::<_, std::convert::Infallible>(c2)
-                        }));
-                    let mut resp = Response::new(Body::from_stream(s));
-                    resp.headers_mut().insert(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("text/event-stream"),
+                        }),
                     );
+                    let mut resp = Response::new(Body::from_stream(s));
+                    resp.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
                     resp
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
         let res = client
@@ -6782,17 +7586,17 @@ mod tests {
                 let body = body.clone();
                 async move {
                     let mut resp = Response::new(Body::from(body));
-                    resp.headers_mut().insert(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("text/event-stream"),
-                    );
+                    resp.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
                     resp
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
         let res = client
@@ -6854,9 +7658,10 @@ mod tests {
             "max_tokens": 32,
             "stream": false
         }));
-        let r = messages(State(app), auth_headers(), axum::Json(request)).await.unwrap();
+        let r = messages(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
         let (status, _body) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
     }
-
 }

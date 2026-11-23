@@ -114,15 +114,15 @@ pub fn build_model_list_content(
             );
             let left_formatted = format!("{:4} {}", left_price, left_model.id);
             if let Some(&right_model) = models.get(i + half) {
-                    let right_price = crate::constants::get_price_tier(
-                        right_model.input_price_usd,
-                        right_model.output_price_usd,
-                    );
-                    let right_formatted = format!("{:4} {}", right_price, right_model.id);
-                    result.push_str(&format!("  {:48} {}\n", left_formatted, right_formatted));
-                } else {
-                    result.push_str(&format!("  {}\n", left_formatted));
-                }
+                let right_price = crate::constants::get_price_tier(
+                    right_model.input_price_usd,
+                    right_model.output_price_usd,
+                );
+                let right_formatted = format!("{:4} {}", right_price, right_model.id);
+                result.push_str(&format!("  {:48} {}\n", left_formatted, right_formatted));
+            } else {
+                result.push_str(&format!("  {}\n", left_formatted));
+            }
         }
         result
     };
@@ -213,10 +213,7 @@ mod tests {
     #[test]
     fn test_format_backend_error_token_exceed_without_limit() {
         // Line 28: "total of X tokens" present but "maximum context length" absent
-        let message = format_backend_error(
-            "requested a total of 120000 tokens which exceed",
-            "{}",
-        );
+        let message = format_backend_error("requested a total of 120000 tokens which exceed", "{}");
         assert!(message.contains("Requested: 120000"));
         // No "Limit:" since "maximum context length of" is not in the message
         assert!(!message.contains("Limit:"));
@@ -225,10 +222,8 @@ mod tests {
     #[test]
     fn test_format_backend_error_token_exceed_without_requested() {
         // Line 35: "maximum context length" present but "total of" absent
-        let message = format_backend_error(
-            "token exceed maximum context length of 64000 tokens",
-            "{}",
-        );
+        let message =
+            format_backend_error("token exceed maximum context length of 64000 tokens", "{}");
         assert!(message.contains("Limit: 64000"));
         // No "Requested:" since "total of" is not in the message
         assert!(!message.contains("Requested:"));
@@ -300,12 +295,14 @@ mod tests {
     #[test]
     fn test_build_model_list_content_odd_count_no_right_column() {
         // Line 125: odd number of models → last row has no right column
-        let models: Vec<ModelInfo> = (0..3).map(|i| ModelInfo {
-            id: format!("model-{i}"),
-            input_price_usd: None,
-            output_price_usd: None,
-            supported_features: vec![],
-        }).collect();
+        let models: Vec<ModelInfo> = (0..3)
+            .map(|i| ModelInfo {
+                id: format!("model-{i}"),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec![],
+            })
+            .collect();
         let content = build_model_list_content("test", &models);
         assert!(content.contains("model-0"));
         assert!(content.contains("model-1"));
@@ -363,9 +360,24 @@ mod tests {
     #[test]
     fn test_build_model_list_content_odd_count() {
         let models = vec![
-            ModelInfo { id: "a/model1".into(), input_price_usd: None, output_price_usd: None, supported_features: vec![] },
-            ModelInfo { id: "b/model2".into(), input_price_usd: None, output_price_usd: None, supported_features: vec![] },
-            ModelInfo { id: "c/model3".into(), input_price_usd: None, output_price_usd: None, supported_features: vec![] },
+            ModelInfo {
+                id: "a/model1".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec![],
+            },
+            ModelInfo {
+                id: "b/model2".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec![],
+            },
+            ModelInfo {
+                id: "c/model3".into(),
+                input_price_usd: None,
+                output_price_usd: None,
+                supported_features: vec![],
+            },
         ];
         let content = build_model_list_content("missing", &models);
         assert!(content.contains("model1"));
@@ -412,5 +424,4 @@ mod tests {
         assert!(content.contains("zai-org/GLM-Alpha"));
         assert!(content.contains("### 🧠 REASONING"));
     }
-
 }

@@ -29,6 +29,10 @@ rand = "0.9"
 # Intel root CA. rustcrypto backend (no ring/assembly) keeps macOS/arm64 clean.
 dcap-qvl = { version = "0.7", default-features = false, features = ["std", "rustcrypto", "default-x509"] }
 hex = "0.4"
+# X.509 cert parsing for FMSPC extraction from the PCK leaf cert in a TDX quote.
+# Pinned to the version dcap-qvl already pulls in transitively (0.3.0) so no new
+# transitive dependency is introduced — only a direct dependency on what's there.
+x509-cert = "0.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

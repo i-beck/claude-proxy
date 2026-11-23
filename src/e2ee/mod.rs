@@ -155,12 +155,14 @@ mod tests {
         // Chunk 1: nonce(12) + ct + tag(16)
         let chunk1_plaintext = b"data: {\"type\":\"message_start\"}\n\n";
         let chunk1_nonce = random_bytes(12);
-        let chunk1_ct = chacha20poly1305_seal(&stream_key, &chunk1_nonce, chunk1_plaintext, b"").unwrap();
+        let chunk1_ct =
+            chacha20poly1305_seal(&stream_key, &chunk1_nonce, chunk1_plaintext, b"").unwrap();
         let chunk1_blob = [chunk1_nonce.as_slice(), chunk1_ct.as_slice()].concat();
         // Chunk 2
         let chunk2_plaintext = b"data: {\"type\":\"content_block_delta\"}\n\n";
         let chunk2_nonce = random_bytes(12);
-        let chunk2_ct = chacha20poly1305_seal(&stream_key, &chunk2_nonce, chunk2_plaintext, b"").unwrap();
+        let chunk2_ct =
+            chacha20poly1305_seal(&stream_key, &chunk2_nonce, chunk2_plaintext, b"").unwrap();
         let chunk2_blob = [chunk2_nonce.as_slice(), chunk2_ct.as_slice()].concat();
         // Client decrypts stream.
         let derived_stream_key = decrypt_stream_init(&client_kp.secret_key, &e2e_init_ct).unwrap();

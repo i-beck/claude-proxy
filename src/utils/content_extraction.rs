@@ -47,8 +47,8 @@ pub fn count_input_tokens(
     // tiktoken_rs::cl100k_base() always returns Ok in practice — the bundled
     // BPE table is statically linked.  Using expect() keeps the defensive
     // panic message without creating an llvm-cov-unreachable Err arm.
-    let encoder = tiktoken_rs::cl100k_base()
-        .expect("tiktoken_rs::cl100k_base() BPE table always loads");
+    let encoder =
+        tiktoken_rs::cl100k_base().expect("tiktoken_rs::cl100k_base() BPE table always loads");
     let text_tokens = encoder.encode_with_special_tokens(&combined_text).len();
     let image_tokens = image_count * TOKENS_PER_IMAGE;
     (text_tokens + image_tokens) as u32
@@ -764,7 +764,8 @@ mod tests {
             role: "user".into(),
             content: json!("hi"),
         }];
-        let count_with_system = count_input_tokens(&messages, &Some(json!("You are helpful")), &None);
+        let count_with_system =
+            count_input_tokens(&messages, &Some(json!("You are helpful")), &None);
         let count_without = count_input_tokens(&messages, &None, &None);
         assert!(count_with_system > count_without);
     }
@@ -893,7 +894,8 @@ mod tests {
 
     #[test]
     fn test_convert_tool_choice_object_missing_type() {
-        let (result, parallel) = convert_tool_choice(Some(json!({"disable_parallel_tool_use": true})));
+        let (result, parallel) =
+            convert_tool_choice(Some(json!({"disable_parallel_tool_use": true})));
         assert_eq!(result, Some(json!({"disable_parallel_tool_use": true})));
         assert_eq!(parallel, Some(false));
     }
@@ -916,7 +918,10 @@ mod tests {
             "type": "function",
             "function": {"name": "foo"}
         })));
-        assert_eq!(result, Some(json!({"type": "function", "function": {"name": "foo"}})));
+        assert_eq!(
+            result,
+            Some(json!({"type": "function", "function": {"name": "foo"}}))
+        );
         assert_eq!(parallel, None);
     }
 
@@ -1151,10 +1156,13 @@ mod tests {
             "type": "tool",
             "tool_name": "my_tool"
         })));
-        assert_eq!(result, Some(json!({
-            "type": "function",
-            "function": {"name": "my_tool"}
-        })));
+        assert_eq!(
+            result,
+            Some(json!({
+                "type": "function",
+                "function": {"name": "my_tool"}
+            }))
+        );
     }
 
     #[test]
@@ -1285,7 +1293,8 @@ mod tests {
 
     #[test]
     fn test_convert_tool_choice_empty_object_with_parallel() {
-        let (_result, parallel) = convert_tool_choice(Some(json!({"disable_parallel_tool_use": false})));
+        let (_result, parallel) =
+            convert_tool_choice(Some(json!({"disable_parallel_tool_use": false})));
         assert_eq!(parallel, Some(true));
     }
 
@@ -1324,7 +1333,6 @@ mod tests {
         let _ = convert_tool_choice(Some(json!({"type": "weird"})));
         let _ = convert_tool_choice(Some(json!(42)));
     }
-
 
     #[test]
     fn test_convert_system_object() {

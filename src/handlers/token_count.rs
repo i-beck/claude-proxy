@@ -122,6 +122,4 @@ mod tests {
         // Should include image tokens (85 per image)
         assert!(body["input_tokens"].as_u64().unwrap() > 85);
     }
-
-
 }

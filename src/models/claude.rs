@@ -277,7 +277,9 @@ mod tests {
         }))
         .unwrap();
 
-        let ClaudeContentBlock::Document { source, .. } = block else { panic!("expected document block") };
+        let ClaudeContentBlock::Document { source, .. } = block else {
+            panic!("expected document block")
+        };
         assert_eq!(source.source_type, "base64");
         assert_eq!(source.media_type.as_deref(), Some("application/pdf"));
         assert_eq!(source.data.as_deref(), Some("ZmFrZQ=="));
@@ -296,7 +298,9 @@ mod tests {
         }))
         .unwrap();
 
-        let ClaudeContentBlock::Document { source, .. } = block else { panic!("expected document block") };
+        let ClaudeContentBlock::Document { source, .. } = block else {
+            panic!("expected document block")
+        };
         assert_eq!(source.source_type, "url");
         assert_eq!(source.url.as_deref(), Some("https://example.com/file.pdf"));
         assert_eq!(source.data, None);
@@ -314,7 +318,9 @@ mod tests {
         }))
         .unwrap();
 
-        let ClaudeContentBlock::Document { source, .. } = block else { panic!("expected document block") };
+        let ClaudeContentBlock::Document { source, .. } = block else {
+            panic!("expected document block")
+        };
         assert_eq!(source.source_type, "file");
         assert_eq!(source.file_id.as_deref(), Some("file_123"));
         assert_eq!(source.data, None);
@@ -374,7 +380,8 @@ mod tests {
         let config: ThinkingConfig = serde_json::from_value(json!({
             "type": "enabled",
             "budget_tokens": 5000
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(
             config.into_backend_config(),
             Some(BackendThinkingConfig {
@@ -388,7 +395,8 @@ mod tests {
     fn test_thinking_config_disabled_returns_none() {
         let config: ThinkingConfig = serde_json::from_value(json!({
             "type": "disabled"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(config.into_backend_config(), None);
     }
 
@@ -397,7 +405,8 @@ mod tests {
         let request: ClaudeRequest = serde_json::from_value(json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "hi"}]
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(request.max_tokens.is_none());
         assert!(request.temperature.is_none());
         assert!(request.top_p.is_none());
@@ -418,9 +427,13 @@ mod tests {
             "model": "test-model",
             "messages": [{"role": "user", "content": "hi"}],
             "output_config": {"effortLevel": "high"}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(
-            request.output_config.as_ref().and_then(|c| c.effort.as_deref()),
+            request
+                .output_config
+                .as_ref()
+                .and_then(|c| c.effort.as_deref()),
             Some("high")
         );
     }
@@ -436,7 +449,8 @@ mod tests {
         let request: ClaudeTokenCountRequest = serde_json::from_value(json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hi"}]
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(request.model, "test");
         assert_eq!(request.messages.len(), 1);
         assert!(request.system.is_none());
@@ -449,7 +463,8 @@ mod tests {
             "name": "test_tool",
             "description": "A test tool",
             "input_schema": {"type": "object"}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(tool.name, "test_tool");
         assert_eq!(tool.description.as_deref(), Some("A test tool"));
     }
@@ -459,10 +474,9 @@ mod tests {
         let tool: ClaudeTool = serde_json::from_value(json!({
             "name": "test_tool",
             "input_schema": {"type": "object"}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(tool.name, "test_tool");
         assert!(tool.description.is_none());
     }
-
-
 }

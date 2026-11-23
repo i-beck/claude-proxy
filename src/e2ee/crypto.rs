@@ -137,7 +137,13 @@ pub fn chacha20poly1305_seal(
     let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::Keygen)?;
     let nonce = Nonce::from_slice(nonce);
     cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::Encapsulate)
 }
 
@@ -161,7 +167,13 @@ pub fn chacha20poly1305_open(
     let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::Keygen)?;
     let nonce = Nonce::from_slice(nonce);
     cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::Decapsulate)
 }
 
@@ -258,10 +270,7 @@ pub fn encrypt_request(
 ///
 /// Parses the blob, decapsulates the ML-KEM ciphertext, derives the request key,
 /// and opens the ChaCha20-Poly1305 ciphertext, then gunzips.
-pub fn decrypt_request_blob(
-    server_secret_key: &[u8],
-    blob: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt_request_blob(server_secret_key: &[u8], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let (mlkem_ct, nonce, ciphertext_with_tag) = parse_request_blob(blob)?;
     let shared_secret = decapsulate(server_secret_key, mlkem_ct)?;
     let salt = &mlkem_ct[..16];
@@ -275,10 +284,7 @@ pub fn decrypt_request_blob(
 ///
 /// The response blob has the same layout as the request blob. The client uses
 /// its ephemeral response secret key to decapsulate, then HKDF info="e2e-resp-v1".
-pub fn decrypt_response(
-    response_secret_key: &[u8],
-    blob: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt_response(response_secret_key: &[u8], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let (mlkem_ct, nonce, ciphertext_with_tag) = parse_request_blob(blob)?;
     let shared_secret = decapsulate(response_secret_key, mlkem_ct)?;
     let salt = &mlkem_ct[..16];

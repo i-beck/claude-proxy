@@ -241,7 +241,10 @@ mod tests {
         for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
             breaker.record_failure();
         }
-        assert_eq!(breaker.consecutive_failures, CIRCUIT_BREAKER_FAILURE_THRESHOLD);
+        assert_eq!(
+            breaker.consecutive_failures,
+            CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        );
         assert!(breaker.is_open); // is_open set even when disabled
         assert!(!breaker.enabled);
     }

@@ -129,7 +129,9 @@ mod tests {
             }),
         );
 
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
         format!("http://{addr}/v1/chat/completions")
     }
@@ -247,18 +249,19 @@ mod tests {
             get(move |headers: axum::http::HeaderMap| {
                 let received_host = received_host_clone.clone();
                 async move {
-                    *received_host.write().await =
-                        headers.get("host").and_then(|v| v.to_str().ok()).map(String::from);
+                    *received_host.write().await = headers
+                        .get("host")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
                     Json(json!({ "data": [] }))
                 }
             }),
         );
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
-        let mut app_with_host = make_app(
-            format!("http://{addr}/v1/chat/completions"),
-            None,
-        );
+        let mut app_with_host = make_app(format!("http://{addr}/v1/chat/completions"), None);
         app_with_host.backend_host_header = Some("custom-host.example.com".into());
 
         refresh_models_cache(&app_with_host).await.unwrap();
@@ -270,11 +273,8 @@ mod tests {
     async fn test_refresh_models_cache_handles_long_error_body() {
         // Line 39: error_text.len() > 200 branch in the warn! log
         let long_error = "x".repeat(300);
-        let backend_url = spawn_models_server(
-            StatusCode::BAD_GATEWAY,
-            json!({ "error": long_error }),
-        )
-        .await;
+        let backend_url =
+            spawn_models_server(StatusCode::BAD_GATEWAY, json!({ "error": long_error })).await;
         let app = make_app(backend_url, None);
         let result = refresh_models_cache(&app).await;
         assert!(result.is_err());
@@ -293,7 +293,8 @@ mod tests {
         let backend_url = spawn_models_server(
             StatusCode::OK,
             json!({"data": [{"id": "free-model", "supported_features": ["tools"]}]}),
-        ).await;
+        )
+        .await;
         let app = make_app(backend_url, None);
         refresh_models_cache(&app).await.unwrap();
         let cache = app.models_cache.read().await;
@@ -322,10 +323,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_models_cache_models_with_id_only() {
-        let backend_url = spawn_models_server(
-            StatusCode::OK,
-            json!({"data": [{"id": "minimal"}]}),
-        ).await;
+        let backend_url =
+            spawn_models_server(StatusCode::OK, json!({"data": [{"id": "minimal"}]})).await;
         let app = make_app(backend_url, None);
         refresh_models_cache(&app).await.unwrap();
         let cache = app.models_cache.read().await;
@@ -334,10 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_models_cache_no_data_field() {
-        let backend_url = spawn_models_server(
-            StatusCode::OK,
-            json!({"not_data": "wrong"}),
-        ).await;
+        let backend_url = spawn_models_server(StatusCode::OK, json!({"not_data": "wrong"})).await;
         let app = make_app(backend_url, None);
         refresh_models_cache(&app).await.unwrap();
         let cache = app.models_cache.read().await;
@@ -347,14 +343,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_available_models_returns_empty_vec_on_backend_error() {
-        let backend_url = spawn_models_server(
-            StatusCode::BAD_GATEWAY,
-            json!({"error": "unavailable"}),
-        ).await;
+        let backend_url =
+            spawn_models_server(StatusCode::BAD_GATEWAY, json!({"error": "unavailable"})).await;
         let app = make_app(backend_url, None);
         let models = get_available_models(&app).await;
         assert!(models.is_empty());
     }
-
-
 }

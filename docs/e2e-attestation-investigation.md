@@ -199,3 +199,163 @@ The client (`e2e_request_attested`) does:
 This is safe-by-design: when Chutes ships quote material on `/e2e/instances`,
 the verification path is already wired and will reject wrong-MRTD quotes in
 strict mode without any client code change.
+
+## 8. Attestation v2 — live quote + PCS collateral fetch (2026-11-20)
+
+### 8.1 What was added
+
+The v2 implementation adds three network-fetch paths to
+`src/e2ee/attestation.rs`, all gated behind optional fields in
+`AttestationConfig` so the default behavior is unchanged:
+
+| Function | Purpose | Gate |
+|---|---|---|
+| `fetch_quote_from_miner(client, node_ip, nonce)` | Fetch a live TDX quote from the miner's public attestation service (`https://{node_ip}:30443/server/attest?nonce=…`) | `AttestationConfig::node_ip: Some(...)` |
+| `fetch_intel_pcs_collateral(client, quote, pcs_base)` | Fetch Intel PCS collateral (PCK CRL, TCB info, QE identity) for a quote and assemble a `QuoteCollateralV3` for DCAP verification | `AttestationConfig::collateral_url: Some(...)` |
+| `check_attestation_status(client, api_base, api_key, chute_id, instance_id)` | Best-effort control-plane check via `GET /chutes/{id}` → `instances[].verified` | `AttestationConfig::check_status: true` |
+
+### 8.2 Why the client cannot fetch a quote by default
+
+The miner's TEE worker exposes `/server/attest?nonce=<64-hex>` on NodePort
+30443, but that NodePort bridges to the EXTERNAL proxy port (8443), whose
+`/server/attest` route requires `authorize(allow_validator=True)` — see
+`sek8s/src/attestation-proxy/attestation_proxy/service.py`
+(`ExternalProxyServer::proxy_to_host_service_authenticated`). The client
+(user) has no validator credential, and the Chutes user API exposes no
+endpoint that maps `instance_id` → server IP:
+
+- `/servers/{instance_id}/attestation-status` → 404
+- `/servers/{instance_id}` → 401 (needs miner X-Chutes-Nonce/Hotkey/Signature)
+- `/instances/{instance_id}` → 404
+- `/chutes/{chute_id}` → 200, but only exposes `instances[].verified`
+
+So `fetch_quote_from_miner` is only reachable when the operator supplies the
+node IP out-of-band (via `AttestationConfig::node_ip`).
+
+### 8.3 Intel PCS collateral fetch
+
+The `dcap-qvl` 0.7.1 crate's `CollateralClient` is gated behind the `report`
+feature, which pulls `reqwest 0.13` and conflicts with the pinned
+`tower-http 0.6.6`. Instead, `fetch_intel_pcs_collateral` implements the
+same 4-step PCS fetch manually using the existing `reqwest 0.12` + `x509-cert
+0.3` (already transitive via `dcap-qvl`):
+
+1. **PCK CRL**: `GET {pcs_base}/sgx/certification/v4/pckcrl?ca={ca}&encoding=der`
+   — extract `SGX-PCK-CRL-Issuer-Chain` header.
+2. **TCB info**: `GET {pcs_base}/tdx/certification/v4/tcb?fmspc={fmspc}&update=standard`
+   — extract `TCB-Info-Issuer-Chain` header, `tcbInfo` + `signature` from JSON.
+3. **QE identity**: `GET {pcs_base}/tdx/certification/v4/qe/identity?update=standard`
+   — extract `SGX-Enclave-Identity-Issuer-Chain` header, `enclaveIdentity` +
+   `signature` from JSON.
+4. **Root CA CRL**: derive from the CRL distribution point of the root cert
+   in the QE identity issuer chain (Intel PCS does not serve it directly).
+
+The FMSPC and CA type are extracted from the quote's embedded PCK leaf cert
+via `extract_fmspc_and_ca` — parse the quote with `dcap_qvl::quote::Quote`,
+pull the cert chain, parse the leaf cert with `x509-cert`, find the SGX
+extension (OID `1.2.840.113741.1.13.1`), walk the TLV to find the FMSPC
+OID (`1.2.840.113741.1.13.1.4`), and extract the 6-byte FMSPC value.
+
+### 8.4 Attestation status check (Step 3 — best-effort, wired into E2E flow)
+
+`check_attestation_status` queries `GET /chutes/{chute_id}` and looks up
+`instance_id` in the `instances[]` array, returning:
+
+- `AttestationStatus::Verified` — `instances[i].verified == true`
+- `AttestationStatus::Unverified` — `instances[i].verified == false`
+- `AttestationStatus::NotFound` — instance_id not in the list
+
+This is a **control-plane signal**, not cryptographic attestation. The
+Chutes control plane maintains the `verified` flag; it does not carry a
+TDX quote or DCAP collateral.
+
+**Wiring into `e2e_request_attested`**: when `AttestationConfig::check_status`
+is `true` and no quote is available from `/e2e/instances`, the handler falls
+back to the control-plane status check before deciding whether to proceed:
+
+- `Verified` → proceed (even in strict mode — the control plane vouches)
+- `Unverified` → strict refuses, permissive logs and proceeds
+- `NotFound` → strict refuses, permissive logs and proceeds
+- Status check error → strict refuses, permissive logs and proceeds
+
+When `check_status` is `false` (the default), the no-quote path keeps its
+original behavior: strict refuses, permissive proceeds. No `/chutes/` call
+is made.
+
+### 8.5 Test coverage
+
+| Test category | Count | Location |
+|---|---|---|
+| `decode_quote_body` (bare binary, JSON envelope, error cases) | 5 | `attestation.rs` |
+| `extract_fmspc_and_ca` (fixture + garbage) | 2 | `attestation.rs` |
+| `new_attestation_nonce` (length, randomness) | 2 | `attestation.rs` |
+| `quote_url` (URL construction) | 1 | `attestation.rs` |
+| `fetch_quote_simple` mock-server (binary, JSON, error, refused) | 4 | `attestation.rs` |
+| `AttestationFetchError` display | 1 | `attestation.rs` |
+| `check_attestation_status` mock-server (verified, unverified, not-found, empty, missing, error) | 6 | `handler.rs` |
+| `check_status` integration through `e2e_request_attested` (verified/strict, unverified/strict, unverified/permissive, not-found/strict, error/strict) | 5 | `handler.rs` |
+| `node_ip` integration through `e2e_request_attested` (unreachable/strict→refuse, unreachable/permissive→proceed) | 2 | `handler.rs` |
+| Real-fixture fetch pipeline (bare binary + JSON envelope → fetch → decode → parse → FMSPC extract) | 2 | `attestation.rs` |
+| `#[ignore]` network tests (live miner, live PCS, full flow, live check_status GLM-5.1, live check_status GLM-5.2, full orchestration) | 6 | `attestation.rs` + `smoke.rs` |
+| **Total new tests** | **35** | |
+
+Total test suite: **659 passed, 0 failed, 8 ignored** (629 baseline + 31 new
+unit/integration + 6 `#[ignore]` network/live tests). The full orchestration
+test (`test_full_attestation_orchestration_mock_miner_live_pcs`) runs the
+complete pipeline — mock miner serving the real fixture → fetch → parse → live
+Intel PCS fetch → `verify_dcap` → `verify` — and is live-verified. The
+`check_status` path is live-verified against **both** TEE models: GLM-5.1-TEE
+and GLM-5.2-TEE.
+
+The `#[ignore]` `test_fetch_intel_pcs_collateral_live` was run against the real
+Intel PCS (`api.trustedservices.intel.com`) and **passes**: the manual 4-step
+collateral fetch assembles a well-formed `QuoteCollateralV3` that `dcap-qvl`
+accepts, and `verify_dcap` returns `OutOfDate` for the June-2025 fixture verified
+at the current time (the correct result — Intel has advanced the TCB level since
+then). Note: Intel PCS serves TDX collateral at the **v4** endpoints
+(`/tdx/certification/v4/...`); the v3 endpoints return 404.
+
+### 8.7 Live verification (2026-11-20)
+
+Three things were verified against real infrastructure:
+
+- **`test_fetch_intel_pcs_collateral_live`** — the manual PCS fetch pipeline
+  works end-to-end against `api.trustedservices.intel.com` (v4 endpoints).
+- **`e2e_smoke_test_real_tee_model`** — the full `e2e_request_attested` path
+  (discovery → encrypt → attestation → E2E invoke → decrypt) was exercised
+  against the real Chutes TEE model `zai-org/GLM-5.1-TEE` and returned a valid
+  decrypted response. This confirms the attestation wiring does not break the
+  live E2E flow (the no-quote permissive path proceeds as designed).
+- **`check_attestation_status` field shape** — a live `GET /chutes/{chute_id}`
+  (with `Authorization: Bearer $CHUTES_API_KEY`) returns HTTP 200 with a top-level
+  `instances[]` array whose entries carry `instance_id` (string) and `verified`
+  (bool), exactly the fields `check_attestation_status` matches on. All 9
+  instances of the TEE chute report `verified=True`, so a live
+  `check_status: true` call returns `AttestationStatus::Verified`. This confirms
+  the `check_status` path is correct against the real API, not just the mock.
+- **`instance_id` namespace match** — the `instance_id` returned by
+  `/e2e/instances/{chute_id}` (used by discovery) is the **same identifier**
+  as the `instance_id` in `/chutes/{chute_id}`'s `instances[]` array. A live
+  probe showed all 5 e2e instance IDs are present in the 9-entry chutes list
+  (5/5 overlap). So `check_attestation_status` — which looks up the discovery
+  `instance_id` in `/chutes/{id}` — will find a match and return
+  `AttestationStatus::Verified` in production, not `NotFound`.
+- **`check_status: true` end-to-end** — `e2e_smoke_test_check_status_live`
+  drives `e2e_request_attested` with `check_status: true` against the real
+  API: the handler calls `GET /chutes/{chute_id}`, looks up the discovery
+  `instance_id`, finds `verified=True`, and the full E2E flow completes and
+  decrypts a valid response. This confirms the `check_status` path works
+  inside a real request, not just as a standalone function.
+
+### 8.6 Run the network tests
+
+```bash
+# Live miner quote fetch (requires a reachable miner node IP):
+CHUTES_MINER_IP=10.0.0.1 cargo test -- --ignored test_fetch_quote_from_miner_live
+
+# Live Intel PCS collateral fetch + DCAP verify (requires network access):
+cargo test -- --ignored test_fetch_intel_pcs_collateral_live
+
+# Full end-to-end flow (requires both):
+CHUTES_MINER_IP=10.0.0.1 cargo test -- --ignored test_full_attestation_flow_live
+```
