@@ -454,7 +454,7 @@ ATTESTATION_SAVE_COLLATERAL=1 cargo test --release -- --ignored test_live_save_c
 
 3. **Collateral regeneration gate**: `ATTESTATION_SAVE_COLLATERAL=1 cargo test -- --ignored test_live_save_collateral_fixture` writes a fresh `live_tdx_collateral.json` via `fetch_intel_pcs_collateral` + real Intel PCS, so the offline fixture never goes stale. Full default-suite result after commit `5ded623`: `660 passed, 0 failed, 10 ignored; 0 measured; 0 filtered out` (the 10 ignored are network tests + the save-fixture gate).
 
-4. **No commit/push per the user's hard constraint**: all v2 changes were committed on `2026-11_refresh` in two commits (`5ded623` + `ce6b255`). The subsequent `use_evidence` evidence-path work (§8.8) is currently **uncommitted** in the working tree (per the same constraint).
+4. **Committed + pushed (2026-11-23)**: the v2/v3 work is fully committed on `2026-11_refresh` and pushed to origin — `5ded623` (live TDX quote fetch + DCAP verify), `ce6b255` (docs), `adcf69d` (`use_evidence` evidence-path + DCAP collateral + both-models parity), `ecf4b51` (GLM-5.2→Kimi-K3-TEE swap), `7e82b0b` (offline coverage for reachable-but-untested paths), `4ce8650` (COVERAGE.md 689-test / 96.32% ceiling baseline). The earlier "uncommitted" note was a 2026-11-22 snapshot; the user explicitly authorized committing + pushing the v2/v3 work on 2026-11-23, so the tree is now clean and synced 0/0 with origin.
 
 ### 8.8 The `use_evidence` evidence path (2026-11-23)
 
@@ -501,3 +501,36 @@ quote's `report_data[32..]` cert-hash. `test_use_evidence_valid_quote_proceeds_i
 drives the full `e2e_request_attested` flow through a mock server with the
 real quote+cert and proceeds in strict mode, proving the binding invariant is
 exercised end-to-end offline.
+
+### 8.9 Full `--ignored` live-suite run (2026-11-23 — per-test results)
+
+Command: `cargo test --release -- --ignored` (with `CHUTES_API_KEY` sourced from
+`~/.hermes/.env`; `CHUTES_MINER_IP` intentionally **unset**). Result:
+**13 passed, 2 "failed"** — and both "failures" are the documented by-design
+`CHUTES_MINER_IP` validator-gated tests, not code defects.
+
+| # | Test | Location | Result | Disposition |
+|---|---|---|---|---|
+| 1 | `test_evidence_cert_binding_live` | `attestation.rs` | **PASS** | Live cert-hash key-binding + DCAP (GLM-5.1-TEE) |
+| 2 | `test_fetch_intel_pcs_collateral_live` | `attestation.rs` | **PASS** | Live 4-step PCS fetch + `OutOfDate` on June-2025 fixture |
+| 3 | `test_fetch_quote_from_miner_live` | `attestation.rs` | **SKIP (by design)** | `expect("set CHUTES_MINER_IP")` — raw `:30443/server/attest` hop is validator-gated; unreachable by a user API client (§8.2). No env var → panic, not a code bug. |
+| 4 | `test_full_attestation_flow_live` | `attestation.rs` | **SKIP (by design)** | Same as #3 — requires `CHUTES_MINER_IP` + a reachable miner node. |
+| 5 | `test_full_attestation_orchestration_live_api` | `attestation.rs` | **PASS** | Full fetch→parse→live PCS→DCAP against real Chutes API |
+| 6 | `test_full_attestation_orchestration_mock_miner_live_pcs` | `attestation.rs` | **PASS** | Mock miner + real Intel PCS end-to-end |
+| 7 | `test_live_save_collateral_fixture` | `attestation.rs` | **PASS** | Regenerates `live_tdx_collateral.json` from live PCS |
+| 8 | `e2e_smoke_test_check_status_live` | `smoke.rs` | **PASS** | `check_status` E2E (GLM-5.1-TEE) |
+| 9 | `e2e_smoke_test_check_status_live_k3` | `smoke.rs` | **PASS** | `check_status` E2E (Kimi-K3-TEE) |
+| 10 | `e2e_smoke_test_real_tee_model` | `smoke.rs` | **PASS** | Full `e2e_request_attested` against real TEE |
+| 11 | `e2e_smoke_test_streaming_real_tee_model` | `smoke.rs` | **PASS** | Streaming variant against real TEE |
+| 12 | `e2e_smoke_test_use_evidence_collateral_live` | `smoke.rs` | **PASS** | Combined `use_evidence`+collateral+DCAP (GLM-5.1-TEE) |
+| 13 | `e2e_smoke_test_use_evidence_collateral_live_k3` | `smoke.rs` | **PASS** | Same combined path (Kimi-K3-TEE) |
+| 14 | `e2e_smoke_test_use_evidence_live` | `smoke.rs` | **PASS** | `use_evidence` E2E (GLM-5.1-TEE) |
+| 15 | `e2e_smoke_test_use_evidence_live_k3` | `smoke.rs` | **PASS** | `use_evidence` E2E (Kimi-K3-TEE) |
+
+**Verdict**: 13/15 pass live against real Chutes + Intel PCS. The 2 non-passing
+tests are the raw-miner-hop tests that require `CHUTES_MINER_IP` (a node IP that
+no user API client can obtain — §8.2). They are skipped by design, not fixed:
+the miner hop is validator-gated, so there is no code path to repair. To exercise
+them, an operator must supply `CHUTES_MINER_IP=<reachable-miner-node>` out-of-band.
+The user-reachable evidence endpoint (§8.8) is the production substitute and is
+fully live-verified by tests #1, #5, #12, #14.
