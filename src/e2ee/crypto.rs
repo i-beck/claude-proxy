@@ -33,6 +33,32 @@ impl std::fmt::Display for CryptoError {
 
 impl std::error::Error for CryptoError {}
 
+/// FIX 3: human-readable message for end users.
+///
+/// The original error is preserved as the debug source — this is a *method on
+/// the error*, so callers can still use `{:?}` / `to_string()` (the `Display`
+/// impl above) for logging while surfacing `user_message()` to the user.
+impl CryptoError {
+    pub fn user_message(&self) -> String {
+        match self {
+            CryptoError::Decapsulate => {
+                "Failed to establish encrypted session with TEE. Attestation key mismatch or stale session. Retry in 2s.".to_string()
+            }
+            CryptoError::InvalidKey(n) => {
+                format!(
+                    "Invalid key format (got {n} bytes, expected 1184) from TEE evidence. Attestation may have failed."
+                )
+            }
+            CryptoError::Keygen => {
+                "Failed to generate an encryption key; the TEE session could not be established.".to_string()
+            }
+            CryptoError::Encapsulate => {
+                "Failed to encrypt the request for the TEE; the session could not be established.".to_string()
+            }
+        }
+    }
+}
+
 /// An ephemeral ML-KEM-768 keypair for one E2E request/response cycle.
 pub struct KeyPair {
     pub public_key: Vec<u8>,

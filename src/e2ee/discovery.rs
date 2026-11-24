@@ -308,6 +308,36 @@ impl std::fmt::Display for DiscoveryError {
 
 impl std::error::Error for DiscoveryError {}
 
+/// FIX 3: human-readable message for end users.
+///
+/// The original error is preserved as the debug source — this is a *method on
+/// the error*, so callers can still use `{:?}` / `to_string()` (the `Display`
+/// impl above) for logging while surfacing `user_message()` to the user. The
+/// `Crypto` variant delegates to the inner `CryptoError::user_message()`.
+impl DiscoveryError {
+    pub fn user_message(&self) -> String {
+        match self {
+            DiscoveryError::NoNonces => {
+                "No encryption nonce available from the TEE. Check instance is live and E2E is offered."
+                    .to_string()
+            }
+            DiscoveryError::Crypto(e) => e.user_message(),
+            DiscoveryError::Http(e) => {
+                format!("Network error reaching the TEE: {e}. Please try again in a moment.")
+            }
+            DiscoveryError::Parse(e) => {
+                format!("Malformed response from the TEE discovery service: {e}. Please try again.")
+            }
+            DiscoveryError::Status(code, _) => match code {
+                403 => "The TEE rejected the discovery request (nonce expired or invalid). Retry in 2s.".to_string(),
+                404 => "The TEE instance could not be found. It may have gone offline.".to_string(),
+                500..=599 => "The TEE discovery service is temporarily unavailable. Please try again.".to_string(),
+                other => format!("The TEE discovery service returned an unexpected error ({other}). Please try again."),
+            },
+        }
+    }
+}
+
 impl From<CryptoError> for DiscoveryError {
     fn from(e: CryptoError) -> Self {
         DiscoveryError::Crypto(e)

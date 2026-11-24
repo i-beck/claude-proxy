@@ -38,6 +38,39 @@ impl std::fmt::Display for E2EError {
 
 impl std::error::Error for E2EError {}
 
+/// FIX 3: human-readable message for end users.
+///
+/// The original error is preserved as the debug source — this is a *method on
+/// the error*, so callers can still use `{:?}` / `to_string()` (the `Display`
+/// impl above) for logging while surfacing `user_message()` to the user. Each
+/// variant maps to a plain-language message; the `Crypto` / `Attestation` /
+/// `Discovery` variants delegate to their inner error's `user_message()`.
+impl E2EError {
+    pub fn user_message(&self) -> String {
+        match self {
+            E2EError::Discovery(e) => e.user_message(),
+            E2EError::Crypto(e) => e.user_message(),
+            E2EError::Http(e) => {
+                format!("Network error talking to the TEE: {e}. Please try again in a moment.")
+            }
+            E2EError::Status(code, _body) => match code {
+                403 => "The TEE rejected the request (nonce expired or invalid). Retry in 2s.".to_string(),
+                404 => "The TEE instance could not be found. It may have gone offline.".to_string(),
+                500..=599 => "The TEE service is temporarily unavailable. Please try again in a moment.".to_string(),
+                other => format!("The TEE service returned an unexpected error ({other}). Please try again."),
+            },
+            E2EError::Parse(msg) => {
+                format!("Malformed response from the TEE: {msg}. Please try again.")
+            }
+            E2EError::NoNonce => {
+                "No encryption nonce available from the TEE. Check instance is live and E2E is offered."
+                    .to_string()
+            }
+            E2EError::Attestation(e) => e.user_message(),
+        }
+    }
+}
+
 impl From<DiscoveryError> for E2EError {
     fn from(e: DiscoveryError) -> Self {
         E2EError::Discovery(e)
@@ -671,6 +704,94 @@ mod tests {
         assert!(is_nonce_403(403, r#"{"detail":"Invalid nonce"}"#));
         assert!(!is_nonce_403(403, r#"{"detail":"forbidden"}"#));
         assert!(!is_nonce_403(401, r#"{"detail":"nonce expired"}"#));
+    }
+
+    // ── FIX 3: human-readable error messages ──────────────────────────────
+
+    #[test]
+    fn test_crypto_error_user_message_decapsulate() {
+        // Exact string from the task spec.
+        assert_eq!(
+            CryptoError::Decapsulate.user_message(),
+            "Failed to establish encrypted session with TEE. Attestation key mismatch or stale session. Retry in 2s."
+        );
+    }
+
+    #[test]
+    fn test_crypto_error_user_message_invalid_key() {
+        // Exact string from the task spec, with the byte count interpolated.
+        assert_eq!(
+            CryptoError::InvalidKey(7).user_message(),
+            "Invalid key format (got 7 bytes, expected 1184) from TEE evidence. Attestation may have failed."
+        );
+        assert_eq!(
+            CryptoError::InvalidKey(1184).user_message(),
+            "Invalid key format (got 1184 bytes, expected 1184) from TEE evidence. Attestation may have failed."
+        );
+    }
+
+    #[test]
+    fn test_e2e_error_user_message_no_nonce() {
+        // Exact string from the task spec.
+        assert_eq!(
+            E2EError::NoNonce.user_message(),
+            "No encryption nonce available from the TEE. Check instance is live and E2E is offered."
+        );
+    }
+
+    #[test]
+    fn test_e2e_error_user_message_delegates_to_inner_errors() {
+        // E2EError::Crypto delegates to CryptoError::user_message().
+        let e = E2EError::Crypto(CryptoError::Decapsulate);
+        assert_eq!(
+            e.user_message(),
+            "Failed to establish encrypted session with TEE. Attestation key mismatch or stale session. Retry in 2s."
+        );
+        // E2EError::Discovery delegates to DiscoveryError::user_message()
+        // (NoNonces → same string as E2EError::NoNonce).
+        let d = E2EError::Discovery(DiscoveryError::NoNonces);
+        assert_eq!(
+            d.user_message(),
+            "No encryption nonce available from the TEE. Check instance is live and E2E is offered."
+        );
+        // E2EError::Attestation delegates to AttestationError::user_message().
+        let a = E2EError::Attestation(AttestationError::NonceMismatch {
+            expected: "a".into(),
+            got: "b".into(),
+        });
+        assert_eq!(
+            a.user_message(),
+            "The TEE attestation nonce did not match. The session may be stale. Retry in 2s."
+        );
+    }
+
+    #[test]
+    fn test_e2e_error_user_message_status_variants() {
+        // 403 → nonce/expired message.
+        assert_eq!(
+            E2EError::Status(403, "nonce expired".into()).user_message(),
+            "The TEE rejected the request (nonce expired or invalid). Retry in 2s."
+        );
+        // 5xx → temporary-unavailable message.
+        assert_eq!(
+            E2EError::Status(503, "boom".into()).user_message(),
+            "The TEE service is temporarily unavailable. Please try again in a moment."
+        );
+    }
+
+    #[test]
+    fn test_user_message_keeps_original_error_as_debug_source() {
+        // The original error is preserved as the debug source: `{:?}` /
+        // `to_string()` still yield the machine-readable form, independent of
+        // `user_message()`.
+        let e = CryptoError::Decapsulate;
+        assert_eq!(format!("{e:?}"), "Decapsulate");
+        assert_eq!(e.to_string(), "ML-KEM decapsulate failed");
+        assert_ne!(
+            e.user_message(),
+            e.to_string(),
+            "user_message must differ from the debug Display form"
+        );
     }
 
     #[test]

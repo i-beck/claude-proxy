@@ -299,6 +299,51 @@ impl std::fmt::Display for AttestationError {
 
 impl std::error::Error for AttestationError {}
 
+/// FIX 3: human-readable message for end users.
+///
+/// The original error is preserved as the debug source — this is a *method on
+/// the error*, so callers can still use `{:?}` / `to_string()` (the `Display`
+/// impl above) for logging while surfacing `user_message()` to the user.
+impl AttestationError {
+    pub fn user_message(&self) -> String {
+        match self {
+            AttestationError::QuoteTooShort { len } => format!(
+                "The TEE attestation data is incomplete (got {len} bytes). The TEE may have failed to produce a quote. Please try again."
+            ),
+            AttestationError::InvalidVersion { got } => format!(
+                "The TEE returned an unsupported attestation format (version {got}). The TEE may be running an outdated image. Please try again."
+            ),
+            AttestationError::InvalidTeeType { got } => format!(
+                "The TEE returned an unexpected attestation type (0x{got:08X}). The TEE may be misconfigured. Please try again."
+            ),
+            AttestationError::MrtdMismatch { version, .. }
+            | AttestationError::Rtmr1Mismatch { version, .. }
+            | AttestationError::Rtmr2Mismatch { version, .. }
+            | AttestationError::Rtmr3Mismatch { version, .. } => format!(
+                "The TEE's measurements did not match the trusted image {version}. The TEE may be compromised or running an untrusted image. Please try again."
+            ),
+            AttestationError::UnknownVersion { version } => format!(
+                "The TEE is running image version {version}, which has no trusted measurements on record. Please try again."
+            ),
+            AttestationError::NonceMismatch { .. } => {
+                "The TEE attestation nonce did not match. The session may be stale. Retry in 2s.".to_string()
+            }
+            AttestationError::KeyBindingMismatch { .. } => {
+                "The TEE attestation key binding failed. Attestation may have failed. Please try again."
+                    .to_string()
+            }
+            AttestationError::InvalidHex { .. } => {
+                "The TEE attestation contained malformed measurement data. Please try again."
+                    .to_string()
+            }
+            AttestationError::InvalidBase64 => {
+                "The TEE attestation data was not in the expected format. Please try again."
+                    .to_string()
+            }
+        }
+    }
+}
+
 /// Parse a raw TDX quote byte slice into a `TdxQuote`.
 ///
 /// Validates the minimum size, quote version, and TEE type. Extracts MRTD,
