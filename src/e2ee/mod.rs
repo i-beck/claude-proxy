@@ -179,4 +179,165 @@ mod tests {
         let short = vec![0u8; 20]; // < 12 + 16
         assert!(decrypt_stream_chunk(&stream_key, &short).is_err());
     }
+
+    // ── FIX 2: SSE partial-chunk buffering ─────────────────────────────────
+    //
+    // The E2E stream is SSE: each `data:` event carries a JSON object with an
+    // `e2e` field whose base64 payload is a variable-length frame
+    // `nonce(12) || ciphertext || tag(16)`. Frames are delimited by the `\n\n`
+    // event boundary, NOT by a byte count, so the buffer reassembles raw bytes
+    // into complete events and only then parses + decrypts. The helpers below
+    // build a real encrypted frame and wrap it in an SSE event.
+
+    /// Build a real encrypted stream frame `nonce(12) || ct || tag(16)`.
+    fn mk_stream_frame(stream_key: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let nonce = random_bytes(12);
+        let ct = chacha20poly1305_seal(stream_key, &nonce, plaintext, b"").unwrap();
+        [nonce.as_slice(), ct.as_slice()].concat()
+    }
+
+    /// Wrap a frame in an SSE `data: {\"e2e\": <b64>}\n\n` event.
+    fn sse_event_for_frame(frame: &[u8]) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(frame);
+        format!("data: {{\"e2e\": \"{b64}\"}}\n\n")
+    }
+
+    /// A raw byte chunk that splits an SSE event mid-way must not yield an
+    /// event until the `\n\n` boundary is received; the remainder is kept.
+    #[test]
+    fn test_stream_buffer_sse_event_split_across_pushes() {
+        let mut buf = StreamChunkBuffer::new();
+        let event = sse_event_for_frame(&mk_stream_frame(&random_bytes(32), b"payload"));
+        let bytes = event.as_bytes();
+        // Push everything except the final `\n\n`.
+        buf.push(&bytes[..bytes.len() - 2]);
+        assert!(buf.drain().is_empty(), "no complete event yet (no \\n\\n)");
+        assert_eq!(buf.pending(), bytes.len() - 2);
+        // Push the terminating `\n\n`.
+        buf.push(&bytes[bytes.len() - 2..]);
+        let events = buf.drain();
+        assert_eq!(events.len(), 1, "one complete SSE event after reassembly");
+        assert_eq!(events[0], event.trim());
+        assert_eq!(buf.pending(), 0);
+    }
+
+    /// Two complete SSE events in one push are both extracted in order, and a
+    /// trailing unterminated event is kept for the next push.
+    #[test]
+    fn test_stream_buffer_multiple_events_and_leftover() {
+        let mut buf = StreamChunkBuffer::new();
+        let e1 = sse_event_for_frame(&mk_stream_frame(&random_bytes(32), b"one"));
+        let e2 = sse_event_for_frame(&mk_stream_frame(&random_bytes(32), b"two"));
+        let e3_partial = sse_event_for_frame(&mk_stream_frame(&random_bytes(32), b"three"));
+        // e1 + e2 complete, e3 only half (no closing \n\n).
+        let combined: Vec<u8> = [
+            e1.as_bytes(),
+            e2.as_bytes(),
+            e3_partial.as_bytes()[..e3_partial.len() / 2].as_ref(),
+        ]
+        .concat();
+        buf.push(&combined);
+        let events = buf.drain();
+        assert_eq!(events.len(), 2, "only the two complete events are emitted");
+        assert_eq!(events[0], e1.trim());
+        assert_eq!(events[1], e2.trim());
+        assert!(buf.pending() > 0, "partial e3 kept for next push");
+    }
+
+    /// A complete event that decrypts end-to-end through the real crypto.
+    #[test]
+    fn test_stream_buffer_event_decrypts_reassembled() {
+        let stream_key = random_bytes(32);
+        let plaintext = b"reassembled-across-sse-boundary";
+        let event = sse_event_for_frame(&mk_stream_frame(&stream_key, plaintext));
+        let bytes = event.as_bytes();
+        let mut buf = StreamChunkBuffer::new();
+        // Split at an arbitrary byte position mid-event.
+        let cut = bytes.len() / 3;
+        buf.push(&bytes[..cut]);
+        assert!(buf.drain().is_empty());
+        buf.push(&bytes[cut..]);
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        let frame = parse_sse_event_to_frame(&events[0]).unwrap().unwrap();
+        let dec = decrypt_stream_chunk(&stream_key, &frame).unwrap();
+        assert_eq!(dec, plaintext);
+    }
+
+    /// `parse_sse_event_to_frame` skips non-frame events ([DONE], comments,
+    /// JSON without an `e2e` field) and returns Ok(None) for them.
+    #[test]
+    fn test_parse_sse_event_skips_non_frames() {
+        assert!(parse_sse_event_to_frame("data: [DONE]\n\n").unwrap().is_none());
+        assert!(parse_sse_event_to_frame(": keep-alive\n\n").unwrap().is_none());
+        assert!(parse_sse_event_to_frame("data: {\"type\":\"ping\"}\n\n").unwrap().is_none());
+        assert!(parse_sse_event_to_frame("").unwrap().is_none());
+    }
+
+    /// The async driver reassembles SSE events split across arbitrary byte
+    /// boundaries and decrypts each frame in order.
+    #[tokio::test]
+    async fn test_decrypt_stream_buffered_reassembles_split_events() {
+        use futures::stream;
+        let stream_key = random_bytes(32);
+        let e1 = sse_event_for_frame(&mk_stream_frame(&stream_key, b"first-frame"));
+        let e2 = sse_event_for_frame(&mk_stream_frame(&stream_key, b"second-frame-payload"));
+        let all: Vec<u8> = [e1.as_bytes(), e2.as_bytes()].concat();
+        // Split the raw bytes at 3 arbitrary positions across the two events.
+        let cut1 = all.len() / 4;
+        let cut2 = all.len() / 2;
+        let chunks: Vec<Result<Vec<u8>, std::convert::Infallible>> = vec![
+            Ok(all[..cut1].to_vec()),
+            Ok(all[cut1..cut2].to_vec()),
+            Ok(all[cut2..].to_vec()),
+        ];
+        let s = stream::iter(chunks);
+        let out = decrypt_stream_buffered(&stream_key, s).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], b"first-frame");
+        assert_eq!(out[1], b"second-frame-payload");
+    }
+
+    /// The driver skips a non-frame event ([DONE]) and still decrypts the
+    /// frame events around it.
+    #[tokio::test]
+    async fn test_decrypt_stream_buffered_skips_done_event() {
+        use futures::stream;
+        let stream_key = random_bytes(32);
+        let e1 = sse_event_for_frame(&mk_stream_frame(&stream_key, b"real-payload"));
+        let done = "data: [DONE]\n\n";
+        let all: Vec<u8> = [e1.as_bytes(), done.as_bytes()].concat();
+        let s = stream::iter(vec![Ok::<_, std::convert::Infallible>(all)]);
+        let out = decrypt_stream_buffered(&stream_key, s).await.unwrap();
+        assert_eq!(out.len(), 1, "[DONE] must be skipped, not decrypted");
+        assert_eq!(out[0], b"real-payload");
+    }
+
+    /// The driver times out if a chunk never arrives within the gap window
+    /// (5s in production, a short window here), rather than hanging.
+    #[tokio::test]
+    async fn test_decrypt_stream_buffered_times_out_when_buffer_never_fills() {
+        use std::time::Duration;
+        use tokio_stream::wrappers::ReceiverStream;
+        // A channel that never delivers a chunk: the driver's gap timeout must
+        // fire rather than hang.
+        let (_tx, rx) =
+            tokio::sync::mpsc::channel::<Result<Vec<u8>, std::convert::Infallible>>(1);
+        let s = ReceiverStream::new(rx);
+        let stream_key = random_bytes(32);
+        let start = std::time::Instant::now();
+        let result = decrypt_stream_buffered_timeout(
+            &stream_key,
+            s,
+            Duration::from_millis(200), // short window for test speed
+        )
+        .await;
+        assert!(result.is_err(), "must time out when the buffer never fills");
+        // Must not block more than the timeout window (plus scheduling slack).
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not block more than the timeout window"
+        );
+    }
 }

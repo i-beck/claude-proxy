@@ -317,3 +317,221 @@ pub fn decrypt_stream_chunk(stream_key: &[u8], chunk: &[u8]) -> Result<Vec<u8>, 
     let plaintext = chacha20poly1305_open(stream_key, nonce, ciphertext_with_tag, b"")?;
     Ok(plaintext)
 }
+
+// ── FIX 2: SSE partial-chunk buffering ───────────────────────────────────────
+//
+// The E2E stream wire is SSE: each `data:` event carries a JSON object with an
+// `e2e` field whose base64 payload is a *variable-length* frame
+// `nonce(12) || ciphertext || tag(16)` (minimum `STEM_FRAME_MIN` bytes = 12+16).
+// SSE has no length prefix, so a frame is delimited by the `\n\n` event
+// boundary — NOT by a byte count. A raw byte accumulator that slices
+// fixed-size frames would corrupt variable-length frames, so we instead:
+//
+//   1. Accumulate raw bytes (from reqwest's `bytes_stream()`, which respects no
+//      boundaries) into a buffer.
+//   2. Extract *complete SSE events* by the `\n\n` boundary (an event may be
+//      split across arbitrary SSE/TCP boundaries; the remainder is kept).
+//   3. Parse each event's `data:` payload JSON → base64 `e2e` frame, and only
+//      hand the frame to `decrypt_stream_chunk` when it holds at least
+//      `nonce(12) + tag(16)` bytes (`decrypt_stream_chunk` itself also enforces
+//      this and rejects `InvalidKey(len)` for a truncated frame).
+//   4. Never block more than `STREAM_GAP_TIMEOUT_SECS` (5s) waiting for enough
+//      bytes — if no chunk arrives within the gap, the driver errors rather
+//      than hangs.
+
+/// Minimum bytes for a complete (decodable) stream frame: nonce(12) + tag(16).
+pub const STREAM_MIN_FRAME: usize = 12 + 16;
+
+/// Maximum gap (seconds) the driver waits for enough bytes before erroring.
+pub const STREAM_GAP_TIMEOUT_SECS: u64 = 5;
+
+/// Append raw bytes and extract complete SSE events by the `\n\n` boundary,
+/// keeping the unterminated remainder for the next push.
+#[derive(Debug, Default)]
+pub struct StreamChunkBuffer {
+    buf: Vec<u8>,
+}
+
+impl StreamChunkBuffer {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Append raw stream bytes. Returns the number appended.
+    pub fn push(&mut self, bytes: &[u8]) -> usize {
+        let n = bytes.len();
+        self.buf.extend_from_slice(bytes);
+        n
+    }
+
+    /// Current buffered (unparsed) byte count.
+    pub fn pending(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Extract complete SSE events (terminated by `\n\n`) from the buffer,
+    /// returning each as a trimmed string. Keeps the trailing unterminated
+    /// remainder so an event split across SSE/TCP boundaries is reassembled.
+    pub fn drain(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(pos) = find_subslice(&self.buf, b"\n\n") {
+            let event: Vec<u8> = self.buf.drain(..pos + 2).collect();
+            let s = String::from_utf8_lossy(&event).trim().to_string();
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// Flush the unterminated tail as a final event (end of stream). Returns
+    /// None if the buffer is empty; otherwise returns the remaining bytes as a
+    /// trimmed string (even if not `\n\n`-terminated) so trailing data is not
+    /// lost, and clears the buffer.
+    pub fn flush(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let rest: Vec<u8> = self.buf.drain(..).collect();
+        let s = String::from_utf8_lossy(&rest).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// True when the buffer holds at least one complete SSE event.
+    fn has_complete_event(&self) -> bool {
+        find_subslice(&self.buf, b"\n\n").is_some()
+    }
+}
+
+/// C1: find a subslice's first occurrence (no `memchr`/extra deps).
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse one SSE event into its base64 `e2e` frame. Accepts a single event's
+/// text (which may contain multiple `data:` lines). Concatenates the data
+/// lines, parses them as JSON, and returns the base64-decoded `e2e` bytes.
+///
+/// Returns `Ok(None)` for events that are not JSON `e2e` frames (e.g.
+/// `[DONE]`, comments, keep-alives) so the driver skips them silently.
+pub fn parse_sse_event_to_frame(event: &str) -> Result<Option<Vec<u8>>, CryptoError> {
+    // Concatenate all `data:` lines of this event (SSE spec).
+    let mut data = String::new();
+    for line in event.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim_start());
+        } else if line.starts_with("event:") || line.starts_with(':') || line.is_empty() {
+            // ignore event-type / comment / blank lines
+            continue;
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(None);
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(data).map_err(|_| CryptoError::Decapsulate)?;
+    let frame_b64 = match v.get("e2e").and_then(|e| e.as_str()) {
+        Some(s) => s,
+        None => return Ok(None), // JSON without an e2e field (heartbeat/etc.)
+    };
+    use base64::Engine;
+    let frame = base64::engine::general_purpose::STANDARD
+        .decode(frame_b64)
+        .map_err(|_| CryptoError::InvalidKey(frame_b64.len()))?;
+    // Guard: only return a complete frame (nonce + tag minimum).
+    if frame.len() < STREAM_MIN_FRAME {
+        return Err(CryptoError::InvalidKey(frame.len()));
+    }
+    Ok(Some(frame))
+}
+
+/// Drive a raw byte stream through [`StreamChunkBuffer`], parsing SSE events
+/// into frames and decrypting each via `decrypt_stream_chunk`. Never blocks
+/// more than `STREAM_GAP_TIMEOUT_SECS` waiting for enough bytes: if no chunk
+/// arrives within the window the driver errors (a stalled connection), rather
+/// than hanging forever.
+///
+/// `stream` is any `Stream<Item = Result<Vec<u8>, E>>` (e.g.
+/// `reqwest::Response::bytes_stream()` items). Bytes may split an SSE event at
+/// arbitrary boundaries. `stream_key` decrypts each `e2e` frame.
+pub async fn decrypt_stream_buffered<S, E>(
+    stream_key: &[u8],
+    stream: S,
+) -> Result<Vec<Vec<u8>>, CryptoError>
+where
+    S: futures::Stream<Item = Result<Vec<u8>, E>> + Unpin,
+    E: std::fmt::Debug,
+{
+    decrypt_stream_buffered_timeout(
+        stream_key,
+        stream,
+        std::time::Duration::from_secs(STREAM_GAP_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// Same as [`decrypt_stream_buffered`] but with an explicit gap timeout, so the
+/// 5s invariant can be exercised with a short window in tests.
+pub async fn decrypt_stream_buffered_timeout<S, E>(
+    stream_key: &[u8],
+    mut stream: S,
+    gap_timeout: std::time::Duration,
+) -> Result<Vec<Vec<u8>>, CryptoError>
+where
+    S: futures::Stream<Item = Result<Vec<u8>, E>> + Unpin,
+    E: std::fmt::Debug,
+{
+    use futures::StreamExt;
+    let mut buffer = StreamChunkBuffer::new();
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(gap_timeout, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                buffer.push(&chunk);
+                for event in buffer.drain() {
+                    if let Some(frame) = parse_sse_event_to_frame(&event)? {
+                        out.push(decrypt_stream_chunk(stream_key, &frame)?);
+                    }
+                }
+            }
+            Ok(Some(Err(_e))) => {
+                // Transport error: flush any trailing event and stop.
+                if let Some(event) = buffer.flush() {
+                    if let Some(frame) = parse_sse_event_to_frame(&event)? {
+                        out.push(decrypt_stream_chunk(stream_key, &frame)?);
+                    }
+                }
+                break;
+            }
+            Ok(None) => {
+                // Stream ended: emit any trailing event, then stop.
+                if let Some(event) = buffer.flush() {
+                    if let Some(frame) = parse_sse_event_to_frame(&event)? {
+                        out.push(decrypt_stream_chunk(stream_key, &frame)?);
+                    }
+                }
+                break;
+            }
+            Err(_elapsed) => {
+                // Timed out waiting for enough bytes — the buffer never filled.
+                return Err(CryptoError::Decapsulate);
+            }
+        }
+    }
+    Ok(out)
+}
