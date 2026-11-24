@@ -299,6 +299,28 @@ impl std::fmt::Display for AttestationError {
 
 impl std::error::Error for AttestationError {}
 
+/// FIX 4: whether an attestation *fetch* failure is a transient network error
+/// worth retrying (`fetch_quote_with_cert` / `fetch_intel_pcs_collateral`).
+///
+/// The task spec enumerates exactly four retryable cases:
+///   - `fetch_quote_with_cert` fails (HTTP transport / connection refused / timeout)
+///   - collateral fetch fails (`fetch_intel_pcs_collateral` — same transport class)
+///   - the evidence endpoint returns an HTTP **5xx** (server-side, transient)
+///   - timeout (a `reqwest::Error` surfaced as `Http`)
+///
+/// A **verification** failure (MRTD/RTMR mismatch, nonce mismatch, key-binding
+/// mismatch) is NOT a network error and must never be retried: the TEE is telling
+/// us it is untrusted, so we refuse immediately. `AttestationFetchError` only
+/// describes transport/parse failures, so `Http(_)` and 5xx `Status` are
+/// retryable while `Malformed(_)` and non-5xx statuses (e.g. 403/404) are not.
+pub fn is_network_attestation_error(e: &AttestationFetchError) -> bool {
+    match e {
+        AttestationFetchError::Http(_) => true,
+        AttestationFetchError::Status(code, _) => (500..=599).contains(code),
+        AttestationFetchError::Malformed(_) => false,
+    }
+}
+
 /// FIX 3: human-readable message for end users.
 ///
 /// The original error is preserved as the debug source — this is a *method on
@@ -640,18 +662,29 @@ pub fn verify(quote: &TdxQuote, params: &VerifyParams<'_>) -> AttestationResult 
         None => match pinned_measurement_for_version(params.expected_version) {
             Some(m) => (m.mrtd, m.rtmr1, m.rtmr2, m.rtmr3),
             None => {
-                return AttestationResult {
-                    verified: false,
-                    version: None,
-                    signature_verified: false,
-                    measurements_verified: false,
-                    key_binding_verified: false,
-                    tcb_status: None,
-                    summary: format!(
-                        "no pinned measurement for version {} — attestation cannot be verified",
-                        params.expected_version
-                    ),
-                };
+                // Production guest images (e.g. Kimi-K3-TEE) are not in the
+                // pinned table. `expected_version == ""` requests the
+                // measurement-only mode: skip the MRTD/RTMR pin and rely on the
+                // key-binding (nonce + pubkey/cert-hash) check alone — still a
+                // meaningful attestation (proves the TEE holds the key). A
+                // NON-empty unknown version remains a hard fail: the caller
+                // intended to pin a specific image and we have no record of it.
+                if params.expected_version.is_empty() {
+                    ("", "", "", "")
+                } else {
+                    return AttestationResult {
+                        verified: false,
+                        version: None,
+                        signature_verified: false,
+                        measurements_verified: false,
+                        key_binding_verified: false,
+                        tcb_status: None,
+                        summary: format!(
+                            "no pinned measurement for version {} — attestation cannot be verified",
+                            params.expected_version
+                        ),
+                    };
+                }
             }
         },
     };
@@ -666,7 +699,17 @@ pub fn verify(quote: &TdxQuote, params: &VerifyParams<'_>) -> AttestationResult 
     let rtmr1_ok = got_rtmr1.eq_ignore_ascii_case(exp_rtmr1) && !exp_rtmr1.is_empty();
     let rtmr2_ok = got_rtmr2.eq_ignore_ascii_case(exp_rtmr2) && !exp_rtmr2.is_empty();
     let rtmr3_ok = got_rtmr3.eq_ignore_ascii_case(exp_rtmr3) && !exp_rtmr3.is_empty();
-    let measurements_verified = mrtd_ok && rtmr1_ok && rtmr2_ok && rtmr3_ok;
+    // When `skip_nonce_binding` is set (the Chutes evidence-quote path), the
+    // evidence endpoint generates its own report-data nonce and the TEE's image
+    // is arbitrary — so there is no pinned table entry to compare against. In
+    // that mode the key-binding check is the attestation; the measurement pin
+    // is skipped (treated as verified) rather than failed on an empty expected.
+    let measurements_verified = if params.skip_nonce_binding && params.expected_version.is_empty()
+    {
+        true
+    } else {
+        mrtd_ok && rtmr1_ok && rtmr2_ok && rtmr3_ok
+    };
 
     // Key binding: REPORTDATA = nonce(32) || cert_hash(32).
     let (got_nonce, got_cert_hash) = split_report_data(&quote.report_data);

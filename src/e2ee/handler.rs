@@ -345,6 +345,13 @@ impl<'a> Default for AttestationConfig<'a> {
     }
 }
 
+/// FIX 4: the delay (seconds) before the single silent retry of a network-failed
+/// `use_evidence` evidence/collateral fetch in strict mode. The spec: "instead
+/// of refusing immediately in strict mode, retry once after 3s. Only refuse if
+/// second attempt also fails." Tests stub this to 0s via
+/// [`e2e_request_attested_with_delay`].
+pub const STRICT_MODE_RETRY_DELAY_SECS: u64 = 3;
+
 /// E2E request with attestation verification.
 ///
 /// After acquiring an instance, if the instance carries a TDX quote, the quote
@@ -363,6 +370,35 @@ pub async fn e2e_request_attested(
     stream: bool,
     original_path: &str,
     attest: &AttestationConfig<'_>,
+) -> Result<E2EResponse, E2EError> {
+    e2e_request_attested_with_delay(
+        discovery,
+        client,
+        api_base,
+        api_key,
+        chute_id,
+        payload,
+        stream,
+        original_path,
+        attest,
+        STRICT_MODE_RETRY_DELAY_SECS,
+    )
+    .await
+}
+
+/// Same as [`e2e_request_attested`] but with an explicit strict-mode retry
+/// delay, so tests exercise the network-error retry path without a real 3s wait.
+pub async fn e2e_request_attested_with_delay(
+    discovery: &Discovery,
+    client: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    chute_id: &str,
+    payload: &[u8],
+    stream: bool,
+    original_path: &str,
+    attest: &AttestationConfig<'_>,
+    retry_delay_secs: u64,
 ) -> Result<E2EResponse, E2EError> {
     // Acquire instance + nonce + optional quote.
     let (instance_id, server_pubkey, nonce, quote) = discovery
@@ -409,9 +445,35 @@ pub async fn e2e_request_attested(
     // `SHA-256(SPKI-der(cert)) == report_data[32..]` via `expected_pubkey`.
     let mut evidence_spki: Option<Vec<u8>> = None;
     if attest.use_evidence && live_quote.is_none() {
-        match attestation::fetch_quote_with_cert(client, api_base, api_key, &instance_id, &nonce)
-            .await
-        {
+        // FIX 4: one silent retry (after STRICT_MODE_RETRY_DELAY) — but only on a
+        // *network* error, never on a verification failure. use_evidence is the
+        // only place this retry can trigger (per the spec).
+        let mut evidence_result =
+            attestation::fetch_quote_with_cert(client, api_base, api_key, &instance_id, &nonce)
+                .await;
+        if let Err(e) = &evidence_result {
+            if attest.mode == AttestationMode::Strict
+                && attestation::is_network_attestation_error(e)
+            {
+                log::warn!(
+                    "attestation: evidence fetch failed with a network error ({e}); \
+                     retrying once after {retry_delay_secs}s (strict mode)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+                evidence_result = attestation::fetch_quote_with_cert(
+                    client,
+                    api_base,
+                    api_key,
+                    &instance_id,
+                    &nonce,
+                )
+                .await;
+                if let Err(e2) = &evidence_result {
+                    log::warn!("attestation: evidence fetch retry also failed: {e2}");
+                }
+            }
+        }
+        match evidence_result {
             Ok(ev) => {
                 log::info!(
                     "attestation: fetched evidence quote from Chutes API ({} bytes)",
@@ -460,7 +522,30 @@ pub async fn e2e_request_attested(
         let mut collateral: Option<attestation::DcapCollateral> = None;
         if let Some(url) = attest.collateral_url {
             let base = if url.is_empty() { None } else { Some(url) };
-            match attestation::fetch_intel_pcs_collateral(client, quote_bytes, base).await {
+            // FIX 4: collateral fetch is a listed network-error trigger. Retry
+            // once (STRICT_MODE_RETRY_DELAY) on a network error, refuse only if
+            // the retry also fails. The spec ties the retry to the
+            // use_evidence strict path, so it is gated on `use_evidence`.
+            let mut collateral_result =
+                attestation::fetch_intel_pcs_collateral(client, quote_bytes, base).await;
+            if let Err(e) = &collateral_result {
+                if attest.mode == AttestationMode::Strict
+                    && attest.use_evidence
+                    && attestation::is_network_attestation_error(e)
+                {
+                    log::warn!(
+                        "attestation: collateral fetch failed with a network error ({e}); \
+                         retrying once after {retry_delay_secs}s (strict mode)"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+                    collateral_result =
+                        attestation::fetch_intel_pcs_collateral(client, quote_bytes, base).await;
+                    if let Err(e2) = &collateral_result {
+                        log::warn!("attestation: collateral fetch retry also failed: {e2}");
+                    }
+                }
+            }
+            match collateral_result {
                 Ok(c) => {
                     log::info!("attestation: fetched Intel PCS collateral");
                     collateral = Some(c);
@@ -791,6 +876,378 @@ mod tests {
             e.user_message(),
             e.to_string(),
             "user_message must differ from the debug Display form"
+        );
+    }
+
+    // ── FIX 4: strict-mode retry on network-error only ────────────────────
+
+    /// The classifier: only `Http` (transport/timeout) and `Status(5xx)` are
+    /// retryable network errors; `Malformed` and non-5xx statuses are not.
+    #[test]
+    fn test_fix4_is_network_attestation_error_classifier() {
+        use crate::e2ee::attestation::AttestationFetchError as AFE;
+        assert!(attestation::is_network_attestation_error(&AFE::Http(
+            "connection refused".into()
+        )));
+        assert!(attestation::is_network_attestation_error(&AFE::Http(
+            "operation timed out".into()
+        )));
+        assert!(attestation::is_network_attestation_error(&AFE::Status(
+            502,
+            "bad gateway".into()
+        )));
+        assert!(attestation::is_network_attestation_error(&AFE::Status(
+            599, "x".into()
+        )));
+        // NOT retryable: malformed (bad data, not the network) …
+        assert!(!attestation::is_network_attestation_error(&AFE::Malformed(
+            "bad base64".into()
+        )));
+        // … and non-5xx statuses (403/404 are a definitive server answer).
+        assert!(!attestation::is_network_attestation_error(&AFE::Status(
+            403,
+            "forbidden".into()
+        )));
+        assert!(!attestation::is_network_attestation_error(&AFE::Status(
+            404, "nf".into()
+        )));
+    }
+
+    /// `use_evidence` + evidence endpoint returns 500 on the first fetch and
+    /// 200 (a valid quote) on the second → strict mode must RETRY once (delay
+    /// stubbed to 0s) and SUCCEED rather than refuse immediately. This is the
+    /// FIX 4 spec: "instead of refusing immediately in strict mode, retry once
+    /// after 3s. Only refuse if second attempt also fails."
+    #[tokio::test]
+    async fn test_fix4_use_evidence_5xx_retry_succeeds_on_second_attempt() {
+        use axum::{
+            body::Bytes,
+            extract::State as AxumState,
+            http::HeaderMap,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = discovery::base64_encode(&server_kp.public_key);
+        let server_sk = Arc::new(Mutex::new(server_kp.secret_key.clone()));
+        let resp_plaintext = br#"{"ok":true}"#;
+        let evidence_attempt = Arc::new(AtomicU32::new(0));
+        // Real live quote + cert → DCAP parse + key-binding (skips unknown-img check).
+        let evidence_body: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/evidence_response.json"
+        ))
+        .unwrap();
+
+        let instances_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-fix4-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["nonce-fix4"],
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let evidence_attempt_clone = evidence_attempt.clone();
+        let evidence_value = evidence_body.clone();
+        let server_sk_clone = server_sk.clone();
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = instances_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/instances/:instance_id/evidence",
+                get(move |AxumState(attempt): AxumState<Arc<AtomicU32>>| {
+                    let value = evidence_value.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        // First fetch → 500 (network/5xx → retry); second → 200.
+                        if attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"detail": "boom"})),
+                            )
+                                .into_response()
+                        } else {
+                            Json(value).into_response()
+                        }
+                    }
+                }),
+            )
+            .with_state(evidence_attempt_clone)
+            .route(
+                "/e2e/invoke",
+                post(move |_h: HeaderMap, body: Bytes| {
+                    let server_sk = server_sk_clone.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        let sk = server_sk.lock().await;
+                        let req_plaintext = crypto::decrypt_request_blob(&sk, &body).unwrap();
+                        let req_json: serde_json::Value =
+                            serde_json::from_slice(&req_plaintext).unwrap();
+                        let resp_pk_b64 = req_json["e2e_response_pk"].as_str().unwrap();
+                        let resp_pk = discovery::base64_decode(resp_pk_b64).unwrap();
+                        let (mlkem_ct, shared_secret) =
+                            crypto::encapsulate_against_server_pubkey(&resp_pk).unwrap();
+                        let salt = &mlkem_ct[..16];
+                        let resp_key =
+                            crypto::hkdf_sha256(&shared_secret, salt, crypto::HKDF_INFO_RESPONSE)
+                                .unwrap();
+                        let compressed = crypto::gzip_compress(resp_plaintext).unwrap();
+                        let nonce = crypto::random_bytes(12);
+                        let ct = crypto::chacha20poly1305_seal(&resp_key, &nonce, &compressed, b"")
+                            .unwrap();
+                        let (ct_part, tag_part) = ct.split_at(ct.len() - 16);
+                        let blob = crypto::build_request_blob(&mlkem_ct, &nonce, ct_part, tag_part);
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            blob,
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "", // live fixture MRTD is unknown → skip pin, key-binding verifies
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            ..Default::default()
+        };
+        // _with_delay(..., 0) stubs the 3s retry delay so this runs fast.
+        let result = e2e_request_attested_with_delay(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+            0,
+        )
+        .await;
+        // Evidence fetch hit twice: first 500 (retry), second 200 (success).
+        assert_eq!(
+            evidence_attempt.load(Ordering::SeqCst),
+            2,
+            "evidence fetch should be retried exactly once after the first 500"
+        );
+        let result = result.unwrap_or_else(|e| {
+            panic!("5xx-then-200 strict use_evidence should retry + succeed: {e:?}")
+        });
+        let body = result.response.bytes().await.unwrap();
+        let decrypted =
+            decrypt_non_streaming_response(&result.response_secret_key, &body).unwrap();
+        assert_eq!(decrypted, resp_plaintext);
+    }
+
+    /// Second fetch also 500 (network error again) → strict mode must REFUSE,
+    /// after exactly two evidence attempts (no extra retries beyond one).
+    #[tokio::test]
+    async fn test_fix4_use_evidence_5xx_retry_fails_refuses() {
+        use axum::{
+            extract::State as AxumState,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = discovery::base64_encode(&server_kp.public_key);
+        let evidence_attempt = Arc::new(AtomicU32::new(0));
+        let invoke_reached = Arc::new(AtomicU32::new(0));
+
+        let instances_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-fix4b-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["nonce-fix4b"],
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let evidence_attempt_clone = evidence_attempt.clone();
+        let invoke_reached_clone = invoke_reached.clone();
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = instances_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/instances/:instance_id/evidence",
+                get(move |AxumState(attempt): AxumState<Arc<AtomicU32>>| async move {
+                    attempt.fetch_add(1, Ordering::SeqCst);
+                    use axum::response::IntoResponse;
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"detail": "boom"})),
+                    )
+                        .into_response()
+                }),
+            )
+            .with_state(evidence_attempt_clone)
+            .route(
+                "/e2e/invoke",
+                post(move || {
+                    let reached = invoke_reached_clone.clone();
+                    async move {
+                        reached.fetch_add(1, Ordering::SeqCst);
+                        "should not reach here"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "",
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested_with_delay(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+            0,
+        )
+        .await;
+        assert!(result.is_err(), "both 500 fetches should refuse in strict mode");
+        assert_eq!(
+            evidence_attempt.load(Ordering::SeqCst),
+            2,
+            "exactly one retry (two total attempts) should be made"
+        );
+        assert_eq!(
+            invoke_reached.load(Ordering::SeqCst),
+            0,
+            "invoke must not be reached when attestation refuses"
+        );
+        match result.unwrap_err() {
+            E2EError::Attestation(_) => {}
+            other => panic!("expected Attestation error, got {other:?}"),
+        }
+    }
+
+    /// A NON-network error on the evidence fetch (HTTP 403 — a definitive server
+    /// answer, not a transient 5xx) must NOT be retried: strict mode refuses
+    /// after exactly ONE attempt.
+    #[tokio::test]
+    async fn test_fix4_use_evidence_non_network_error_no_retry() {
+        use axum::{
+            extract::State as AxumState,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = discovery::base64_encode(&server_kp.public_key);
+        let evidence_attempt = Arc::new(AtomicU32::new(0));
+
+        let instances_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-fix4c-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["nonce-fix4c"],
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let evidence_attempt_clone = evidence_attempt.clone();
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = instances_body.clone();
+                    async move { Json(body) }
+                }),
+            )
+            .route(
+                "/instances/:instance_id/evidence",
+                get(move |AxumState(attempt): AxumState<Arc<AtomicU32>>| async move {
+                    attempt.fetch_add(1, Ordering::SeqCst);
+                    use axum::response::IntoResponse;
+                    (
+                        axum::http::StatusCode::FORBIDDEN, // 403 → NOT a network error
+                        Json(serde_json::json!({"detail": "forbidden"})),
+                    )
+                        .into_response()
+                }),
+            )
+            .with_state(evidence_attempt_clone)
+            .route("/e2e/invoke", post(|| async { "should not reach here" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let discovery = Discovery::new(client.clone(), api_base.clone());
+        let attest = AttestationConfig {
+            expected_version: "",
+            mode: AttestationMode::Strict,
+            use_evidence: true,
+            ..Default::default()
+        };
+        let result = e2e_request_attested_with_delay(
+            &discovery,
+            &client,
+            &api_base,
+            "test-key",
+            "test-chute",
+            br#"{"model":"test"}"#,
+            false,
+            "/v1/chat/completions",
+            &attest,
+            0,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            evidence_attempt.load(Ordering::SeqCst),
+            1,
+            "a non-network error (403) must NOT be retried"
         );
     }
 
