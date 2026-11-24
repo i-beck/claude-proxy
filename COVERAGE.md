@@ -2,18 +2,18 @@
 
 ## Summary
 
-- **Rust unit/integration tests:** 682 (`cargo test`), all passing; 15 `#[ignore]`d live tests (697 total). 11 are user-reachable and live-verified green — **691 pass** when included (`--include-ignored`, 5 by-design/flaky skips filtered out, the reproducible ceiling). The 2 `CHUTES_MINER_IP` tests are by-design user-API-unreachable and the 3 Kimi-K3 live tests occasionally hit a transient backend 429/timeout. The combined `use_evidence + collateral` path now has **both-models** coverage: `e2e_smoke_test_use_evidence_collateral_live` (GLM-5.1) + `e2e_smoke_test_use_evidence_collateral_live_k3` (Kimi-K3, added 2026-11-23).
+- **Rust unit/integration tests:** 689 (`cargo test`), all passing; 15 `#[ignore]`d live tests (704 total). 10 are user-reachable and live-verified green — **699 pass** when included (`--include-ignored`, 5 by-design/flaky skips filtered out, the reproducible ceiling). The 2 `CHUTES_MINER_IP` tests are by-design user-API-unreachable and the 3 Kimi-K3 live tests occasionally hit a transient backend 429/timeout. The combined `use_evidence + collateral` path now has **both-models** coverage: `e2e_smoke_test_use_evidence_collateral_live` (GLM-5.1) + `e2e_smoke_test_use_evidence_collateral_live_k3` (Kimi-K3, added 2026-11-23).
 - **Shell installer tests:** 32 (`bash tests/test_install_script.sh`), all passing.
 - **Line coverage (`cargo llvm-cov --release`, `src/` total, incl. the test-only e2ee module):**
-  - **Default suite (682 tests): 91.64%** (13,896 / 15,164 lines — the new Kimi-K3 combined live test's ~79 instrumented lines are in the denominator even though it is `#[ignore]`d, so it drags both suites by ~0.5%%).
-  - **Ceiling suite: 96.22%** (14,591 / 15,164 lines) — reproducible, the 5-skip run (2 unreachable miner-IP + the 3 flaky Kimi-K3 live tests). Region coverage is 96.74% (19,305/19,955); the line % is slightly lower than the earlier 96.73% headline because the new Kimi-K3 combined `use_evidence+collateral` test (added 2026-11-23, in the skip-list) adds ~79 test-code lines to the denominator without adding covered lines. When the Kimi-K3 live tests also run the total lands a little higher; this run hit the documented transient 429, so 96.22% is the honest reproducible headline.
+  - **Default suite (689 tests): 91.93%** (14,042 / 15,275 lines — the new Kimi-K3 combined live test's ~79 instrumented lines are in the denominator even though it is `#[ignore]`d, so it drags both suites by ~0.5%%).
+  - **Ceiling suite: 96.32%** (14,713 / 15,275 lines) — reproducible, the 5-skip run (2 unreachable miner-IP + the 3 flaky Kimi-K3 live tests). Region coverage is 96.79% (19,472/20,118); the line % is slightly lower than the earlier 96.73% headline because the new Kimi-K3 combined `use_evidence+collateral` test (added 2026-11-23, in the skip-list) adds ~79 test-code lines to the denominator without adding covered lines. When the Kimi-K3 live tests also run the total lands a little higher; this run hit the documented transient 429, so 96.32% is the honest reproducible headline.
 - **Production code is still ~99.7%** (99.73% in the default suite — 9,618 / 9,644 lines, all of `src/` minus `src/e2ee/`).
 
 | Scope | Default suite | Full (ceiling) |
 |---|---|---|
-| Whole `src/` | 91.64% (13,896/15,164) | **96.22%** (14,591/15,164) |
+| Whole `src/` | 91.93% (14,042/15,275) | **96.32%** (14,713/15,275) |
 | `src/` minus `src/e2ee/` (production) | 99.73% (9,618/9,644) | 99.73% |
-| `src/e2ee/` alone (test-only) | 77.50% (4,278/5,520) | 90.09% (4,973/5,520) |
+| `src/e2ee/` alone (test-only) | 78.57% (4,424/5,631) | 90.48% (5,095/5,631) |
 
 The 99.95% figure in the 2026-11-18 version of this report was measured at
 547 tests / 8,335 lines, before the `src/e2ee/` module existed. The drop in
@@ -25,7 +25,7 @@ production code has not regressed.
 | File | Lines | Default % | Ceiling % | Uncovered |
 |---|---|---|---|---|
 | `src/handlers/messages.rs` | 6352 | 99.75 | 99.75 | messages.rs:1632/1742/1763 (llvm-cov `}` attribution) |
-| `src/e2ee/attestation.rs` | 2318 | 80.67 | 91.80 | miner-fetch/live-PCS/DCAP-via-live paths + error arms |
+| `src/e2ee/attestation.rs` | 2429 | 83.00 | 92.63 | miner-fetch/live-PCS/DCAP-via-live paths + error arms; 2026-11-23 added 7 offline tests for `fetch_attestation_nonce`/`fetch_quote_from_chutes_api`/`from_config_file` malformed-JSON arms |
 | `src/e2ee/handler.rs` | 1925 | 96.68 | 96.68 | Only 4 production lines remain: handler.rs:96 (llvm-cov `}` attribution artifact), and L351/353/355 (node_ip miner-fetch *success* path — hardcoded `https://{ip}:30443`, validator-gated, not mockable over `http`). The collateral-fetch *success* arm (L432-433, L446-449) is now covered offline by a mock-PCS test. The remaining ~46 uncovered lines are test-code `axum::serve` spawn blocks |
 | `src/e2ee/smoke.rs` | 703 | 0.00 | 62.16 | all #[ignore]d live paths (not run in default suite); the Kimi-K3 combined `use_evidence+collateral` test (added 2026-11-23, in the ceiling skip-list) adds ~79 uncovered test-code lines — greener when it runs |
 | `src/e2ee/crypto.rs` | 187 | 90.91 | 90.91 | defensive non-reachable arms |
@@ -60,10 +60,14 @@ production code has not regressed.
   `test_use_evidence_collateral_success_proceeds_in_permissive_mode` (a mock PCS
   serving the captured `live_tdx_collateral.json`) and by the `#[ignore]`d
   `e2e_smoke_test_use_evidence_collateral_live` when the network/PCS is up.
-- **`src/e2ee/attestation.rs` reaches 91.80% at ceiling** once the live
-  miner/PCS/evidence fetches run. The remaining ~8% is by-design unreachable
+- **`src/e2ee/attestation.rs` reaches 92.63% at ceiling** once the live
+  miner/PCS/evidence fetches run. The remaining ~7% is by-design unreachable
   from a user API (raw miner hop), Intel-error arms, and the save-fixture
-  gate path (writes a file, off by default).
+  gate path (writes a file, off by default). The 2026-11-23 offline tests
+  (`fetch_attestation_nonce` valid/error/wrong-length/non-hex,
+  `fetch_quote_from_chutes_api` success/missing-quote, and the
+  `from_config_file` malformed-JSON arm) closed the last reachable gaps in
+  those user-facing fetch helpers.
 - **`token_count.rs:17`** — the `spawn_blocking` `JoinError` arm (retained
   defensively), same as in the 547-test baseline.
 - **`messages.rs:1632/1742/1763`** — standalone `}` closing braces attributed
@@ -102,9 +106,9 @@ which are unchanged.
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 
-cargo test                                   # 682 passed, 15 ignored
+cargo test                                   # 689 passed, 15 ignored
 cargo llvm-cov --release --json --summary-only \
-    --output-path coveragereport/cov.json    # default suite 91.64%
+    --output-path coveragereport/cov.json    # default suite 91.93%
 
 # Ceiling (needs CHUTES_API_KEY; skip the 2 unreachable miner-IP tests +
 # the 3 flaky Kimi-K3 live tests that occasionally hit a 429)
@@ -117,7 +121,7 @@ cargo llvm-cov --release --json --summary-only \
     --skip test_full_attestation_flow_live \
     --skip check_status_live_k3 \
     --skip e2e_smoke_test_use_evidence_live_k3 \
-    --skip e2e_smoke_test_use_evidence_collateral_live_k3   # 96.22% (692 passed, 5 filtered)
+    --skip e2e_smoke_test_use_evidence_collateral_live_k3   # 96.32% (699 passed, 5 filtered)
 # NOTE: the Kimi-K3 live tests share the same backend and can hit a
 # transient 429 ("Instance at maximum capacity"). If you want the full run,
 # drop the Kimi-K3 `--skip` flags and retry — it is not a regression.
