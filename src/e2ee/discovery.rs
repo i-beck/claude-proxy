@@ -145,11 +145,21 @@ impl Discovery {
 
     /// Take a nonce, refreshing if necessary. Returns the instance_id,
     /// e2e_pubkey, nonce, and optional quote.
+    ///
+    /// FIX 1 (nonce pre-fetch): if the cached pool's stated TTL is short
+    /// (`nonce_expires_in < 60`), its nonces are likely to expire before the
+    /// invoke uses them, so proactively refresh rather than hand out a
+    /// near-expired nonce that will 403.
     pub async fn acquire(
         &self,
         chute_id: &str,
         api_key: &str,
     ) -> Result<(String, Vec<u8>, String, Option<Vec<u8>>), DiscoveryError> {
+        // Proactive refresh: discard a near-expiry pool before it hands out a
+        // nonce that will already be stale by invoke time.
+        if self.should_prefetch().await {
+            self.invalidate().await;
+        }
         // Try the cache first.
         if let Some(tuple) = self.take_nonce().await {
             return Ok(tuple);
@@ -157,6 +167,121 @@ impl Discovery {
         // Refresh and retry.
         self.refresh(chute_id, api_key).await?;
         self.take_nonce().await.ok_or(DiscoveryError::NoNonces)
+    }
+
+    /// True when the cached pool's remaining TTL is too short to trust
+    /// (`nonce_expires_in < 60`), so the caller should refresh proactively
+    /// rather than hand out a nonce that will 403 at invoke time.
+    async fn should_prefetch(&self) -> bool {
+        let cache = self.cache.read().await;
+        match cache.as_ref() {
+            Some(c) => c.nonce_expires_in < 60,
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod fix1_prefetch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// When cache is freshly populated with nonce_expires_in < 60,
+    /// acquire() should proactively refresh (i.e., hit the server again)
+    /// rather than serving from the short-lived cache.
+    #[tokio::test]
+    async fn test_acquire_prefetches_when_expires_in_lt_60s() {
+        use axum::{routing::get, Json, Router};
+        let pubkey = base64_encode(&vec![0u8; MLKEM_EK_SIZE]);
+        // Short TTL in the mock response.
+        let resp_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-1",
+                "e2e_pubkey": pubkey,
+                "nonces": ["nonce-short"]
+            }],
+            "nonce_expires_in": 30  // < 60 → should_prefetch() == true
+        });
+
+        let refresh_count = StdArc::new(AtomicUsize::new(0));
+        let count_clone = refresh_count.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/e2e/instances/:chute_id",
+            get(move || {
+                let body = resp_body.clone();
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(body)
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let discovery = Discovery::new(reqwest::Client::new(), format!("http://{addr}"));
+        // First acquire: cache is empty → fetch (count=1).
+        let (id1, _, _, _) = discovery.acquire("chute-x", "key").await.unwrap();
+        assert_eq!(id1, "inst-1");
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+
+        // Second acquire: cache has TTL 30s (< 60) → should_prefetch → invalidate
+        // → refresh (count=2). If pre-fetch were missing, this would be count=1.
+        let (_, _, _, _) = discovery.acquire("chute-x", "key").await.unwrap();
+        assert_eq!(
+            refresh_count.load(Ordering::SeqCst),
+            2,
+            "acquire with nonce_expires_in < 60 should proactively refresh"
+        );
+    }
+
+    /// When TTL >= 60, acquire uses the cache (no extra refresh).
+    #[tokio::test]
+    async fn test_acquire_no_prefetch_when_expires_in_gte_60s() {
+        use axum::{routing::get, Json, Router};
+        let pubkey = base64_encode(&vec![0u8; MLKEM_EK_SIZE]);
+        let resp_body = serde_json::json!({
+            "instances": [{
+                "instance_id": "inst-1",
+                "e2e_pubkey": pubkey,
+                "nonces": ["nonce-1", "nonce-2"]
+            }],
+            "nonce_expires_in": 60  // = 60 → no pre-fetch
+        });
+
+        let refresh_count = StdArc::new(AtomicUsize::new(0));
+        let count_clone = refresh_count.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/e2e/instances/:chute_id",
+            get(move || {
+                let body = resp_body.clone();
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(body)
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let discovery = Discovery::new(reqwest::Client::new(), format!("http://{addr}"));
+        let (_, _, n1, _) = discovery.acquire("chute-x", "key").await.unwrap();
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+
+        // With TTL 60 ≥ 60, should serve from cache (no second refresh).
+        let (_, _, n2, _) = discovery.acquire("chute-x", "key").await.unwrap();
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1, "TTL 60 should not trigger pre-fetch");
+        assert_ne!(n1, n2);
     }
 }
 
