@@ -28,6 +28,7 @@ struct RuntimeConfig {
     circuit_breaker_enabled: bool,
     host_port: u16,
     e2e_enabled: bool,
+    e2e_api_base: String,
 }
 
 impl RuntimeConfig {
@@ -52,6 +53,8 @@ impl RuntimeConfig {
             e2e_enabled: get("E2E_ENABLED")
                 .and_then(|value| value.parse::<bool>().ok())
                 .unwrap_or(false),
+            e2e_api_base: get("E2E_API_BASE")
+                .unwrap_or_else(|| crate::e2ee::attestation::CHUTES_API_BASE.into()),
         }
     }
 }
@@ -74,13 +77,26 @@ fn build_app(config: &RuntimeConfig) -> App {
         backend_host_header: config.backend_host_header.clone(),
         models_cache,
         circuit_breaker,
+        e2e_enabled: config.e2e_enabled,
+        e2e_api_base: config.e2e_api_base.clone(),
     }
 }
 
 fn build_router(app: App) -> Router {
+    // When E2E is enabled, POST /v1/messages is routed to the E2E-aware
+    // handler. The E2E handler takes priority: it routes TEE models
+    // (`-TEE` suffix) through the encrypted/attested path and falls back to
+    // plain HTTP passthrough for non-TEE models and on unrecoverable E2E
+    // failure. When disabled, the plain passthrough handler is used directly.
+    let messages_route = if app.e2e_enabled {
+        post(handlers::messages_e2e)
+    } else {
+        post(handlers::messages)
+    };
+
     Router::new()
         .route("/health", get(handlers::health_check))
-        .route("/v1/messages", post(handlers::messages))
+        .route("/v1/messages", messages_route)
         .route("/v1/messages/count_tokens", post(handlers::count_tokens))
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(tower_http::compression::CompressionLayer::new())
@@ -110,6 +126,14 @@ async fn main() {
             "enabled"
         } else {
             "disabled"
+        }
+    );
+    info!(
+        "   E2E (TEE encryption): {}",
+        if config.e2e_enabled {
+            format!("enabled (API base {})", config.e2e_api_base)
+        } else {
+            "disabled".to_string()
         }
     );
     info!("   Mode: Passthrough with case-correction");
@@ -196,6 +220,7 @@ mod tests {
                 circuit_breaker_enabled: false,
                 host_port: 8080,
                 e2e_enabled: false,
+                e2e_api_base: "https://api.chutes.ai".into(),
             }
         );
     }
@@ -209,6 +234,7 @@ mod tests {
             "ENABLE_CIRCUIT_BREAKER" => Some("true".into()),
             "HOST_PORT" => Some("9090".into()),
             "E2E_ENABLED" => Some("true".into()),
+            "E2E_API_BASE" => Some("https://e2e.example.com".into()),
             _ => None,
         });
 
@@ -221,6 +247,7 @@ mod tests {
                 circuit_breaker_enabled: true,
                 host_port: 9090,
                 e2e_enabled: true,
+                e2e_api_base: "https://e2e.example.com".into(),
             }
         );
 
@@ -230,6 +257,7 @@ mod tests {
             "HOST_PORT" => Some("70000".into()),
             _ => None,
         });
+        assert_eq!(fallback_config.e2e_api_base, "https://api.chutes.ai");
 
         assert_eq!(fallback_config.backend_timeout_secs, 600);
         assert!(!fallback_config.circuit_breaker_enabled);
@@ -246,11 +274,14 @@ mod tests {
             circuit_breaker_enabled: true,
             host_port: 8080,
             e2e_enabled: false,
+            e2e_api_base: "https://api.chutes.ai".into(),
         };
 
         let app = build_app(&config);
 
         assert_eq!(app.backend_url, config.backend_url);
+        assert_eq!(app.e2e_api_base, config.e2e_api_base);
+        assert!(!app.e2e_enabled);
         assert!(app.models_cache.read().await.is_none());
         assert!(app.circuit_breaker.read().await.enabled);
     }
@@ -326,6 +357,143 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// When `e2e_enabled` is true, `POST /v1/messages` routes to the E2E-aware
+    /// handler (priority over plain passthrough). Proof: with a `-TEE` model,
+    /// a valid key, the models cache carrying a `chute_id`, and
+    /// `backend_url` unreachable, the request still returns 200 — served by
+    /// the E2E mock. Had the router chosen the plain handler instead, the
+    /// unreachable backend would have produced 502.
+    #[tokio::test]
+    async fn test_build_router_e2e_priority_routes_tee_model_through_e2e() {
+        use crate::e2ee::crypto;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        // ── Minimal ML-KEM E2E mock (discovery + invoke) ────────────────
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = crate::e2ee::discovery::base64_encode(&server_kp.public_key);
+        let server_sk = Arc::new(Mutex::new(server_kp.secret_key.clone()));
+
+        let instances_body = json!({
+            "instances": [{
+                "instance_id": "inst-router-e2e",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["n1", "n2", "n3", "n4"]
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let mock = axum::Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                axum::routing::get(move || {
+                    let body = instances_body.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                "/e2e/invoke",
+                axum::routing::post(move |_h: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let sk = server_sk.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        let sk = sk.lock().await;
+                        let req_plain = crypto::decrypt_request_blob(&sk, &body).unwrap();
+                        let req_json: Value = serde_json::from_slice(&req_plain).unwrap();
+                        let resp_pk = crate::e2ee::discovery::base64_decode(
+                            req_json["e2e_response_pk"].as_str().unwrap(),
+                        )
+                        .unwrap();
+                        let (mlkem_ct, shared) =
+                            crypto::encapsulate_against_server_pubkey(&resp_pk).unwrap();
+                        let key = crypto::hkdf_sha256(
+                            &shared,
+                            &mlkem_ct[..16],
+                            crypto::HKDF_INFO_RESPONSE,
+                        )
+                        .unwrap();
+                        let oai_resp = json!({
+                            "id": "chatcmpl-r",
+                            "object": "chat.completion",
+                            "model": "Vendor/Foo-TEE",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "via E2E router" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                        });
+                        let compressed =
+                            crypto::gzip_compress(oai_resp.to_string().as_bytes()).unwrap();
+                        let nonce = crypto::random_bytes(12);
+                        let ct =
+                            crypto::chacha20poly1305_seal(&key, &nonce, &compressed, b"").unwrap();
+                        let (c, t) = ct.split_at(ct.len() - 16);
+                        let blob = crypto::build_request_blob(&mlkem_ct, &nonce, c, t);
+                        (
+                            StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            blob,
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let e2e_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ── App: E2E enabled, backend_url unreachable (proves E2E served) ──
+        let config = RuntimeConfig::from_env_with(|key| match key {
+            "E2E_ENABLED" => Some("true".into()),
+            "E2E_API_BASE" => Some(format!("http://{e2e_addr}")),
+            _ => None,
+        });
+        let app = build_app(&config);
+        assert!(app.e2e_enabled);
+        *app.models_cache.write().await = Some(vec![models::ModelInfo {
+            id: "Vendor/Foo-TEE".into(),
+            input_price_usd: None,
+            output_price_usd: None,
+            supported_features: vec![],
+            chute_id: Some("chute-router-tee".into()),
+        }]);
+        let router = build_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "Vendor/Foo-TEE",
+                            "messages": [{ "role": "user", "content": "hi" }],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "E2E mock must have served the request (200); a plain-handler route \
+             would have hit the unreachable backend (502)"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["content"][0]["text"], "via E2E router");
+    }
+
     #[test]
     fn test_runtime_config_from_env_returns_defaults() {
         // Ensure no proxy-specific env vars are set so defaults are used.
@@ -335,6 +503,7 @@ mod tests {
         std::env::remove_var("ENABLE_CIRCUIT_BREAKER");
         std::env::remove_var("HOST_PORT");
         std::env::remove_var("E2E_ENABLED");
+        std::env::remove_var("E2E_API_BASE");
 
         let config = RuntimeConfig::from_env();
         assert_eq!(
@@ -345,5 +514,6 @@ mod tests {
         assert!(!config.circuit_breaker_enabled);
         assert_eq!(config.host_port, 8080);
         assert!(!config.e2e_enabled);
+        assert_eq!(config.e2e_api_base, "https://api.chutes.ai");
     }
 }

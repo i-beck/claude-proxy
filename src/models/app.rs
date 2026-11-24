@@ -10,6 +10,11 @@ pub struct ModelInfo {
     pub input_price_usd: Option<f64>,
     pub output_price_usd: Option<f64>,
     pub supported_features: Vec<String>,
+    /// The Chutes chute UUID for this model, when the backend advertises it
+    /// (`chute_id` field on the models endpoint). Used to route E2E (TEE)
+    /// requests to the correct instance pool. `None` when the backend does
+    /// not report one.
+    pub chute_id: Option<String>,
 }
 
 // ---------- App with cached models and circuit breaker ----------
@@ -21,6 +26,16 @@ pub struct App {
     pub backend_host_header: Option<String>,
     pub models_cache: Arc<RwLock<Option<Vec<ModelInfo>>>>,
     pub circuit_breaker: Arc<RwLock<CircuitBreakerState>>,
+    /// Whether end-to-end encryption (E2E) for TEE models is enabled. When
+    /// `true`, `POST /v1/messages` for a model whose ID contains `-TEE` is
+    /// routed through the E2E request path (discovery + TDX attestation +
+    /// ML-KEM encryption). When `false` (default), all requests use plain
+    /// HTTP passthrough.
+    pub e2e_enabled: bool,
+    /// Base URL for the E2E control plane (discovery + invoke). Defaults to
+    /// `https://api.chutes.ai`. Independent of `backend_url`, which points at
+    /// the LLM inference endpoint.
+    pub e2e_api_base: String,
 }
 
 // ---------- Circuit breaker state ----------

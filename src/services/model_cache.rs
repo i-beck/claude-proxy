@@ -63,11 +63,13 @@ pub async fn refresh_models_cache(app: &App) -> Result<(), Box<dyn std::error::E
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let chute_id = m["chute_id"].as_str().map(String::from);
                     Some(ModelInfo {
                         id,
                         input_price_usd: input_price,
                         output_price_usd: output_price,
                         supported_features,
+                        chute_id,
                     })
                 })
                 .collect()
@@ -110,6 +112,8 @@ mod tests {
             client: reqwest::Client::new(),
             backend_url,
             backend_host_header: None,
+            e2e_enabled: false,
+            e2e_api_base: "https://api.chutes.ai".into(),
             models_cache: Arc::new(RwLock::new(cached_models)),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState::new(false))),
         }
@@ -208,6 +212,7 @@ mod tests {
             input_price_usd: Some(1.0),
             output_price_usd: Some(2.0),
             supported_features: vec![],
+            chute_id: None,
         }];
         let app = make_app(
             "http://127.0.0.1:9/v1/chat/completions".into(),

@@ -42,6 +42,8 @@ mod tests {
             client: reqwest::Client::new(),
             backend_url: "http://127.0.0.1:8000/v1/chat/completions".into(),
             backend_host_header: None,
+            e2e_enabled: false,
+            e2e_api_base: "https://api.chutes.ai".into(),
             models_cache: Arc::new(RwLock::new(Some(
                 (0..cached_models)
                     .map(|idx| ModelInfo {
@@ -49,6 +51,7 @@ mod tests {
                         input_price_usd: None,
                         output_price_usd: None,
                         supported_features: vec![],
+                        chute_id: None,
                     })
                     .collect(),
             ))),
@@ -69,6 +72,8 @@ mod tests {
             client: reqwest::Client::new(),
             backend_url: "http://127.0.0.1:8000/v1/chat/completions".into(),
             backend_host_header: None,
+            e2e_enabled: false,
+            e2e_api_base: "https://api.chutes.ai".into(),
             models_cache: Arc::new(RwLock::new(Some(
                 (0..cached_models)
                     .map(|idx| ModelInfo {
@@ -76,6 +81,7 @@ mod tests {
                         input_price_usd: None,
                         output_price_usd: None,
                         supported_features: vec![],
+                        chute_id: None,
                     })
                     .collect(),
             ))),

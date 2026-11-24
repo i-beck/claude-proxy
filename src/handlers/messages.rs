@@ -1,4 +1,8 @@
 use crate::constants::*;
+use crate::e2ee::attestation::AttestationMode;
+use crate::e2ee::crypto as e2e_crypto;
+use crate::e2ee::discovery::{base64_decode as e2e_base64_decode, Discovery};
+use crate::e2ee::handler::{self as e2e_handler, AttestationConfig, E2EError};
 use crate::models::{
     App, CircuitBreakerState, ClaudeContentBlock, ClaudeRequest, OAIChatReq, OAIMessage,
     OAIStreamChunk,
@@ -1099,13 +1103,41 @@ async fn run_streaming_task(
     }
 }
 
-pub async fn messages(
-    State(app): State<App>,
-    headers: HeaderMap,
-    axum::Json(cr): axum::Json<ClaudeRequest>,
-) -> Result<Response, (StatusCode, &'static str)> {
-    let request_start = SystemTime::now();
+/// The handler result type shared by the plain and E2E paths: either a full
+/// axum `Response`, or the `(StatusCode, &'static str)` tuple axum maps onto
+/// an error status for streaming requests.
+pub(crate) type HandlerResult = Result<Response, (StatusCode, &'static str)>;
 
+/// The result of validating a Claude request and translating it to the
+/// OpenAI chat-completions payload. Shared by the plain-HTTP passthrough path
+/// (`messages`) and the E2E path (`try_e2e_request`) so both build the exact
+/// same backend payload.
+pub(crate) struct TranslatedRequest {
+    /// The OpenAI-format chat-completions request body to send.
+    pub oai: OAIChatReq,
+    /// Whether the client asked for a streaming (SSE) response.
+    pub client_wants_stream: bool,
+    /// Estimated input token count (usage reporting + SSE message_start).
+    pub input_token_count: u32,
+    /// The backend model name after model-cache case-correction.
+    pub backend_model: String,
+    /// The validated client API key (present, and not an Anthropic OAuth token).
+    pub client_key: String,
+    /// Number of Claude messages in the original request (for metrics).
+    pub original_message_count: usize,
+}
+
+/// Validate a Claude request and translate it to the OpenAI payload.
+///
+/// On validation failure, returns `Err` carrying the exact [`HandlerResult`]
+/// the caller must return unchanged (the same `(StatusCode, &'static str)`
+/// tuple / JSON error body the plain path uses), so both the plain and E2E
+/// paths produce identically-shaped validation errors.
+pub(crate) async fn validate_and_translate(
+    app: &App,
+    headers: &HeaderMap,
+    cr: ClaudeRequest,
+) -> Result<TranslatedRequest, HandlerResult> {
     // Determine streaming mode — default to true (Claude Code always streams)
     let client_wants_stream = cr.stream.unwrap_or(true);
     if !client_wants_stream {
@@ -1117,26 +1149,26 @@ pub async fn messages(
         let mut cb = app.circuit_breaker.write().await;
         if !cb.should_allow_request() {
             log::error!("🔴 Circuit breaker is open - rejecting request");
-            return maybe_error_response(
+            return Err(maybe_error_response(
                 client_wants_stream,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "backend_unavailable_circuit_open",
                 "overloaded_error",
                 "Backend temporarily unavailable. Please retry shortly.",
-            );
+            ));
         }
     }
 
     // Request validation
     if cr.messages.is_empty() {
         log::warn!("❌ Validation failed: empty messages");
-        return maybe_error_response(
+        return Err(maybe_error_response(
             client_wants_stream,
             StatusCode::BAD_REQUEST,
             "empty_messages",
             "invalid_request_error",
             "messages must not be empty",
-        );
+        ));
     }
 
     if cr.messages.len() > MAX_MESSAGES_PER_REQUEST {
@@ -1144,13 +1176,13 @@ pub async fn messages(
             "❌ Validation failed: too many messages ({})",
             cr.messages.len()
         );
-        return maybe_error_response(
+        return Err(maybe_error_response(
             client_wants_stream,
             StatusCode::BAD_REQUEST,
             "too_many_messages",
             "invalid_request_error",
             "request exceeds the maximum number of messages",
-        );
+        ));
     }
 
     // Validate message size (rough check)
@@ -1171,13 +1203,13 @@ pub async fn messages(
             "❌ Validation failed: content too large ({} bytes)",
             total_content_size
         );
-        return maybe_error_response(
+        return Err(maybe_error_response(
             client_wants_stream,
             StatusCode::PAYLOAD_TOO_LARGE,
             "content_too_large",
             "request_too_large",
             "request content exceeds the maximum allowed size",
-        );
+        ));
     }
 
     // Validate max_tokens if provided
@@ -1187,13 +1219,13 @@ pub async fn messages(
                 "❌ Validation failed: max_tokens out of range ({})",
                 max_tokens
             );
-            return maybe_error_response(
+            return Err(maybe_error_response(
                 client_wants_stream,
                 StatusCode::BAD_REQUEST,
                 "invalid_max_tokens",
                 "invalid_request_error",
                 "max_tokens is outside the supported range",
-            );
+            ));
         }
     }
 
@@ -1208,13 +1240,13 @@ pub async fn messages(
                 "❌ Validation failed: system prompt too large ({} bytes)",
                 system_size
             );
-            return maybe_error_response(
+            return Err(maybe_error_response(
                 client_wants_stream,
                 StatusCode::BAD_REQUEST,
                 "system_prompt_too_large",
                 "invalid_request_error",
                 "system prompt exceeds the maximum allowed size",
-            );
+            ));
         }
     }
 
@@ -1234,7 +1266,7 @@ pub async fn messages(
     }
 
     // Auth extraction: Authorization or x-api-key
-    let client_key = extract_client_key(&headers);
+    let client_key = extract_client_key(headers);
 
     if let Some(key) = &client_key {
         log::info!("🔑 Client API Key: Bearer {}", mask_token(key));
@@ -1250,9 +1282,33 @@ pub async fn messages(
         app.backend_url
     );
 
+    // Validate auth: reject Anthropic OAuth tokens, require some key.
+    // This is shared validation: both the plain and E2E paths reject the
+    // request identically, before any backend call.
+    let Some(client_key) = client_key else {
+        log::warn!("❌ No client API key provided");
+        return Err(maybe_error_response(
+            client_wants_stream,
+            StatusCode::UNAUTHORIZED,
+            "missing_api_key",
+            "authentication_error",
+            "missing API key",
+        ));
+    };
+    if client_key.contains("sk-ant-") {
+        log::warn!("❌ Anthropic OAuth tokens (sk-ant-*) are not supported - use backend-compatible key (cpk_*)");
+        return Err(maybe_error_response(
+            client_wants_stream,
+            StatusCode::UNAUTHORIZED,
+            "invalid_auth_token",
+            "authentication_error",
+            "Anthropic OAuth tokens are not supported; use a backend-compatible API key",
+        ));
+    }
+    log::info!("🔄 Auth: Forwarding client key to backend");
+
     // Normalize model name (case-correction only)
     let backend_model = normalize_model_name(&cr.model, &app.models_cache).await;
-    let backend_model_for_metrics = backend_model.clone();
 
     // Auto-enable thinking for reasoning models if not explicitly provided
     let thinking_config = if cr.thinking.is_some() {
@@ -1638,13 +1694,13 @@ pub async fn messages(
 
     if msgs.is_empty() {
         log::error!("❌ No messages remaining after conversion!");
-        return maybe_error_response(
+        return Err(maybe_error_response(
             client_wants_stream,
             StatusCode::BAD_REQUEST,
             "no_messages",
             "invalid_request_error",
             "no usable messages remained after request normalization",
-        );
+        ));
     }
 
     let tools = build_oai_tools(cr.tools);
@@ -1654,8 +1710,6 @@ pub async fn messages(
             .as_ref()
             .and_then(|cfg| cfg.effort.as_deref()),
     );
-
-    let backend_model_for_error = backend_model.clone();
 
     // Limit stop sequences to 4 to avoid backend errors (OpenAI limit)
     let stop = cr.stop_sequences.map(|mut s| {
@@ -1668,7 +1722,7 @@ pub async fn messages(
 
     // Mirror the client's stream preference to the backend.
     let oai = OAIChatReq {
-        model: backend_model,
+        model: backend_model.clone(),
         messages: msgs,
         // Do not hard-default; allow backend default if None (safer across models)
         max_tokens: cr.max_tokens,
@@ -1686,6 +1740,44 @@ pub async fn messages(
         metadata: cr.metadata,
         stream: client_wants_stream,
     };
+
+    Ok(TranslatedRequest {
+        oai,
+        client_wants_stream,
+        input_token_count,
+        backend_model,
+        client_key,
+        original_message_count,
+    })
+}
+
+/// Claude Messages API — plain HTTP passthrough path.
+///
+/// Validates + translates the request (shared with the E2E path via
+/// [`validate_and_translate`]), forwards it to the configured backend, and
+/// streams the translated SSE response back to the client.
+pub async fn messages(
+    State(app): State<App>,
+    headers: HeaderMap,
+    axum::Json(cr): axum::Json<ClaudeRequest>,
+) -> HandlerResult {
+    let request_start = SystemTime::now();
+
+    let t = match validate_and_translate(&app, &headers, cr).await {
+        Ok(t) => t,
+        Err(outcome) => return outcome,
+    };
+
+    // Rebind the translated pieces under the names this function's (large,
+    // heavily-tested) body uses, so the backend call + response handling
+    // below is unchanged by the extraction.
+    let oai = t.oai;
+    let client_wants_stream = t.client_wants_stream;
+    let input_token_count = t.input_token_count;
+    let original_message_count = t.original_message_count;
+    let backend_model = t.backend_model.clone();
+    let backend_model_for_error = backend_model.clone();
+    let backend_model_for_metrics = backend_model.clone();
 
     let mut req = app
         .client
@@ -1714,30 +1806,6 @@ pub async fn messages(
 
     if let Some(host) = &app.backend_host_header {
         req = req.header("host", host);
-    }
-
-    // Validate auth: reject Anthropic OAuth tokens, require some key
-    if let Some(key) = &client_key {
-        if key.contains("sk-ant-") {
-            log::warn!("❌ Anthropic OAuth tokens (sk-ant-*) are not supported - use backend-compatible key (cpk_*)");
-            return maybe_error_response(
-                client_wants_stream,
-                StatusCode::UNAUTHORIZED,
-                "invalid_auth_token",
-                "authentication_error",
-                "Anthropic OAuth tokens are not supported; use a backend-compatible API key",
-            );
-        }
-        log::info!("🔄 Auth: Forwarding client key to backend");
-    } else {
-        log::warn!("❌ No client API key provided");
-        return maybe_error_response(
-            client_wants_stream,
-            StatusCode::UNAUTHORIZED,
-            "missing_api_key",
-            "authentication_error",
-            "missing API key",
-        );
     }
 
     // Debug request body (large inline media/file data truncated)
@@ -1949,93 +2017,16 @@ pub async fn messages(
             }
         };
 
-        let model_name = body
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or(&oai.model);
-
-        let choice = body
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first());
-
-        let message = choice.and_then(|c| c.get("message"));
-        let finish_reason = choice
-            .and_then(|c| c.get("finish_reason"))
-            .and_then(|r| r.as_str());
-        let stop_reason = translate_finish_reason(finish_reason);
-
-        let mut content_blocks: Vec<Value> = Vec::new();
-
-        // Extract reasoning_content → thinking block
-        if let Some(reasoning) = message
-            .and_then(|m| m.get("reasoning_content"))
-            .and_then(|r| r.as_str())
-        {
-            if !reasoning.is_empty() {
-                content_blocks.push(json!({
-                    "type": "thinking",
-                    "thinking": reasoning
-                }));
-            }
-        }
-
-        append_non_stream_text_content(&mut content_blocks, message.and_then(|m| m.get("content")));
-
-        // Extract tool_calls → tool_use blocks
-        if let Some(tool_calls) = message
-            .and_then(|m| m.get("tool_calls"))
-            .and_then(|t| t.as_array())
-        {
-            for tc in tool_calls {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let func = tc.get("function");
-                let name = func
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                let args_str = func
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("{}");
-                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-                content_blocks.push(json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input
-                }));
-            }
-        }
-
-        // If no content at all, add empty text block
-        if content_blocks.is_empty() {
-            content_blocks.push(json!({"type": "text", "text": ""}));
-        }
-
-        // Extract usage
-        let usage = body.get("usage");
-        let prompt_tokens = usage
-            .and_then(|u| u.get("prompt_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(input_token_count as u64) as u32;
-        let completion_tokens = usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|t| t.as_u64())
-            .unwrap_or(0) as u32;
-
         // Record circuit breaker success
         {
             let mut cb = app.circuit_breaker.write().await;
             cb.record_success();
         }
 
-        return Ok(build_non_streaming_response(
-            model_name,
-            content_blocks,
-            stop_reason,
-            prompt_tokens,
-            completion_tokens,
+        return Ok(build_claude_response_from_openai_json(
+            &body,
+            &oai.model,
+            input_token_count,
         ));
     }
 
@@ -2063,6 +2054,613 @@ pub async fn messages(
     );
 
     Ok(into_sse_response(rx))
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// E2E (TEE) request path
+// ══════════════════════════════════════════════════════════════════════════
+//
+// When `E2E_ENABLED=true`, the router registers [`messages_e2e`] for
+// `POST /v1/messages` instead of the plain [`messages`] handler. Models whose
+// ID contains `-TEE` are served through the Chutes E2E channel: instance
+// discovery → (optional) TDX attestation verification → ML-KEM-768 request
+// encryption → decrypt the response. Non-TEE models pass through unchanged,
+// and any unrecoverable E2E failure falls back to plain HTTP passthrough so
+// the client still receives an (unencrypted) answer.
+
+/// Translate an OpenAI chat-completion (non-streaming) JSON body into a Claude
+/// Messages API non-streaming response.
+///
+/// Shared by the plain-HTTP path (backend JSON body) and the E2E path (the
+/// decrypted E2E response body is the same OpenAI JSON shape).
+fn build_claude_response_from_openai_json(
+    body: &Value,
+    default_model: &str,
+    input_token_count: u32,
+) -> Response {
+    let model_name = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(default_model);
+
+    let choice = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first());
+
+    let message = choice.and_then(|c| c.get("message"));
+    let finish_reason = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|r| r.as_str());
+    let stop_reason = translate_finish_reason(finish_reason);
+
+    let mut content_blocks: Vec<Value> = Vec::new();
+
+    // Extract reasoning_content → thinking block
+    if let Some(reasoning) = message
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(|r| r.as_str())
+    {
+        if !reasoning.is_empty() {
+            content_blocks.push(json!({
+                "type": "thinking",
+                "thinking": reasoning
+            }));
+        }
+    }
+
+    append_non_stream_text_content(&mut content_blocks, message.and_then(|m| m.get("content")));
+
+    // Extract tool_calls → tool_use blocks
+    if let Some(tool_calls) = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|t| t.as_array())
+    {
+        for tc in tool_calls {
+            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let func = tc.get("function");
+            let name = func
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args_str = func
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("{}");
+            let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            content_blocks.push(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input
+            }));
+        }
+    }
+
+    // If no content at all, add empty text block
+    if content_blocks.is_empty() {
+        content_blocks.push(json!({"type": "text", "text": ""}));
+    }
+
+    // Extract usage
+    let usage = body.get("usage");
+    let prompt_tokens = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(input_token_count as u64) as u32;
+    let completion_tokens = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0) as u32;
+
+    build_non_streaming_response(
+        model_name,
+        content_blocks,
+        stop_reason,
+        prompt_tokens,
+        completion_tokens,
+    )
+}
+
+/// Maximum attempts for the E2E flow across a silent 403-nonce retry (the
+/// first attempt plus one retry, matching the `e2e_request` semantics).
+const E2E_NONCE_MAX_ATTEMPTS: u32 = 2;
+
+/// Claude Messages API — E2E-aware entry point.
+///
+/// Registered for `POST /v1/messages` when `App::e2e_enabled` is true, taking
+/// priority over the plain handler. The confidential-compute gate routes only
+/// models whose ID contains `-TEE` through the encrypted channel; everything
+/// else (and any unrecoverable E2E failure) uses plain HTTP passthrough.
+pub async fn messages_e2e(
+    State(app): State<App>,
+    headers: HeaderMap,
+    axum::Json(cr): axum::Json<ClaudeRequest>,
+) -> HandlerResult {
+    if !app.e2e_enabled || !cr.model.contains("-TEE") {
+        return messages(State(app), headers, axum::Json(cr)).await;
+    }
+
+    log::info!(
+        "🔐 E2E: routing TEE model {} through the encrypted channel",
+        cr.model
+    );
+
+    // Clone for the fallback: on any unrecoverable E2E failure the request is
+    // replayed through the plain HTTP passthrough so the client still gets an
+    // (unencrypted) answer rather than an error.
+    let cr_fallback = cr.clone();
+    let headers_fallback = headers.clone();
+
+    match try_e2e_request(&app, &headers, cr).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            log::warn!("⚠️  E2E request failed ({e}); falling back to plain HTTP passthrough");
+            messages(State(app), headers_fallback, axum::Json(cr_fallback)).await
+        }
+    }
+}
+
+/// The E2E request flow for one TEE request.
+///
+/// Validates + translates the Claude request (shared with the plain path),
+/// resolves the model's chute UUID from the models cache, then runs the E2E
+/// attest-then-encrypt-then-invoke flow with TDX attestation
+/// (`use_evidence`, permissive mode) plus a single silent retry on a 403 nonce
+/// rejection (FIX 1: discovery's nonce pre-fetch also applies on `acquire`).
+///
+/// Returns `Ok(HandlerResult)` — where the inner value is either the finished
+/// E2E response (`Ok(response)`) or the validation failure the caller returns
+/// unchanged (`Err((status, code))`) — or `Err(E2EError)` when the E2E flow
+/// itself failed and the caller should fall back to plain HTTP.
+async fn try_e2e_request(
+    app: &App,
+    headers: &HeaderMap,
+    cr: ClaudeRequest,
+) -> Result<HandlerResult, E2EError> {
+    let t = match validate_and_translate(app, headers, cr).await {
+        Ok(t) => t,
+        // Validation failure is NOT an E2E failure — pass it through untouched
+        // (no fallback: the request is invalid on every path).
+        Err(outcome) => return Ok(outcome),
+    };
+
+    // Confidential-compute routing: the chute UUID for this TEE model comes
+    // from the models cache (populated from the backend /v1/models payload —
+    // the same `chute_id` field the smoke tests resolve via the models API).
+    let chute_id = {
+        let cache = app.models_cache.read().await;
+        cache.as_ref().and_then(|models| {
+            models
+                .iter()
+                .find(|m| m.id.eq_ignore_ascii_case(&t.backend_model))
+                .and_then(|m| m.chute_id.clone())
+        })
+    };
+    let chute_id = match chute_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return Err(E2EError::Parse(format!(
+                "no chute_id available for TEE model {} (models cache lacks the entry)",
+                t.backend_model
+            )));
+        }
+    };
+
+    // Serialize the OpenAI-format payload (e2e_response_pk is injected inside
+    // the E2E handler before encryption).
+    let payload = serde_json::to_vec(&t.oai).map_err(|e| E2EError::Parse(e.to_string()))?;
+
+    let client = app.client.clone();
+    let discovery = Discovery::new(client.clone(), app.e2e_api_base.clone());
+    let attest = AttestationConfig {
+        // Fetch a live TDX quote + TEE cert from the user-reachable evidence
+        // endpoint and verify the cert-hash key binding.
+        use_evidence: true,
+        // Permissive: warn + proceed on attestation gaps (the current API
+        // carries no pinned-measurement guarantee for every image).
+        mode: AttestationMode::Permissive,
+        ..Default::default()
+    };
+
+    // E2E flow with one silent retry on a 403 nonce rejection: invalidate the
+    // nonce pool, re-acquire, and retry once — invisible to the client.
+    let mut attempt = 0u32;
+    let result = loop {
+        attempt += 1;
+        match e2e_handler::e2e_request_attested(
+            &discovery,
+            &client,
+            &app.e2e_api_base,
+            &t.client_key,
+            &chute_id,
+            &payload,
+            t.client_wants_stream,
+            "/v1/chat/completions",
+            &attest,
+        )
+        .await
+        {
+            Err(E2EError::Status(403, ref body))
+                if e2e_handler::is_nonce_403(403, body) && attempt < E2E_NONCE_MAX_ATTEMPTS =>
+            {
+                log::warn!(
+                    "E2E 403 nonce error (attempt {attempt}); refreshing nonce pool and retrying silently"
+                );
+                discovery.invalidate().await;
+            }
+            other => break other,
+        }
+    };
+    let result = result?;
+
+    if t.client_wants_stream {
+        // Streaming: spawn the decrypting E2E task and return the SSE channel.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+        tokio::spawn(run_e2e_streaming_task(
+            tx,
+            result.response,
+            result.response_secret_key,
+            t.oai.model.clone(),
+            t.input_token_count,
+            app.circuit_breaker.clone(),
+        ));
+        Ok(Ok(into_sse_response(rx)))
+    } else {
+        // Non-streaming: read + decrypt the body, then translate the OpenAI
+        // chat-completion JSON to the Claude Messages response.
+        let body = result.response.bytes().await.map_err(E2EError::Http)?;
+        let decrypted =
+            e2e_handler::decrypt_non_streaming_response(&result.response_secret_key, &body)?;
+        let value: Value =
+            serde_json::from_slice(&decrypted).map_err(|e| E2EError::Parse(e.to_string()))?;
+        // Record circuit breaker success (mirror the plain path).
+        {
+            let mut cb = app.circuit_breaker.write().await;
+            cb.record_success();
+        }
+        Ok(Ok(build_claude_response_from_openai_json(
+            &value,
+            &t.oai.model,
+            t.input_token_count,
+        )))
+    }
+}
+
+/// Process one outer E2E SSE event (re-assembled by [`e2e_crypto::StreamChunkBuffer`]).
+///
+/// Handles the three event shapes on the E2E stream:
+/// - `data: {"e2e_init": "<b64 ML-KEM ct>"}` → derive the ChaCha20 stream key.
+/// - `data: {"e2e": "<b64 nonce||ct||tag>"}` → decrypt a chunk of OpenAI SSE
+///   plaintext and feed it through the inner `SseEventParser`, processing each
+///   complete payload exactly like the plain path.
+/// - `[DONE]` / keep-alives → skipped.
+#[allow(clippy::too_many_arguments)]
+async fn handle_e2e_outer_event(
+    event: &str,
+    stream_key: &mut Option<Vec<u8>>,
+    response_secret_key: &[u8],
+    sse_parser: &mut SseEventParser,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+    state: &mut StreamState,
+) -> StreamPayloadOutcome {
+    // Extract the concatenated `data:` payload of this outer SSE event.
+    let mut data = String::new();
+    for line in event.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim_start());
+        }
+    }
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return StreamPayloadOutcome::Continue;
+    }
+    let v: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("E2E outer event is not JSON ({e}); skipping");
+            return StreamPayloadOutcome::Continue;
+        }
+    };
+
+    // e2e_init: derive the stream key for all subsequent e2e frames.
+    if let Some(init_b64) = v.get("e2e_init").and_then(|s| s.as_str()) {
+        match e2e_base64_decode(init_b64) {
+            Ok(init_ct) => match e2e_crypto::decrypt_stream_init(response_secret_key, &init_ct) {
+                Ok(sk) => {
+                    *stream_key = Some(sk);
+                    log::info!("🔐 E2E stream initialized (ML-KEM stream key derived)");
+                }
+                Err(e) => log::error!("E2E stream-init decryption failed: {e}"),
+            },
+            Err(e) => log::error!("E2E stream-init base64 decode failed: {e}"),
+        }
+        return StreamPayloadOutcome::Continue;
+    }
+
+    // e2e frame: decrypt one chunk of OpenAI SSE plaintext.
+    let Some(e2e_b64) = v.get("e2e").and_then(|s| s.as_str()) else {
+        return StreamPayloadOutcome::Continue; // heartbeat / unknown shape
+    };
+    let Some(sk) = stream_key.as_ref() else {
+        log::warn!("E2E frame arrived before e2e_init — dropping");
+        return StreamPayloadOutcome::Continue;
+    };
+    let frame = match e2e_base64_decode(e2e_b64) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("E2E frame base64 decode failed: {e}");
+            return StreamPayloadOutcome::Continue;
+        }
+    };
+    let plaintext = match e2e_crypto::decrypt_stream_chunk(sk, &frame) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("E2E frame decryption failed: {e}");
+            return StreamPayloadOutcome::Continue;
+        }
+    };
+
+    let mut outcome = StreamPayloadOutcome::Continue;
+    for payload in sse_parser.push_and_drain_events(&plaintext) {
+        let data = payload.trim();
+        match process_backend_sse_payload(tx, state, data).await {
+            StreamPayloadOutcome::Continue => {}
+            other => {
+                outcome = other;
+                break;
+            }
+        }
+    }
+    outcome
+}
+
+/// The E2E streaming task: mirrors [`run_streaming_task`] but decrypts the E2E
+/// SSE wrapper (outer `e2e_init`/`e2e` frames) into the inner OpenAI SSE
+/// stream before the usual OpenAI→Claude translation.
+async fn run_e2e_streaming_task(
+    tx: tokio::sync::mpsc::Sender<Event>,
+    res: reqwest::Response,
+    response_secret_key: Vec<u8>,
+    model_for_header: String,
+    input_token_count: u32,
+    circuit_breaker: Arc<tokio::sync::RwLock<CircuitBreakerState>>,
+) {
+    log::debug!("🎬 E2E streaming task started");
+
+    // Emit Claude "message_start" - ensure content is always an array
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let message_obj = serde_json::json!({
+        "id": format!("msg_{now}"),
+        "type": "message",
+        "role": "assistant",
+        "content": serde_json::json!([]),
+        "model": model_for_header,
+        "stop_reason": serde_json::Value::Null,
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": input_token_count,
+            "output_tokens": 0
+        }
+    });
+
+    let start = json!({
+        "type": "message_start",
+        "message": message_obj
+    });
+
+    if tx
+        .send(
+            Event::default()
+                .event("message_start")
+                .data(start.to_string()),
+        )
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before message_start - aborting E2E stream");
+        return;
+    }
+
+    let ping = json!({"type": "ping"});
+    if tx
+        .send(Event::default().event("ping").data(ping.to_string()))
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before ping");
+        return;
+    }
+
+    let mut bytes_stream = res.bytes_stream();
+
+    let mut stream_state = StreamState {
+        next_block_index: 0,
+        thinking_open: false,
+        thinking_index: -1,
+        text_open: false,
+        text_index: -1,
+        tools: HashMap::new(),
+        final_stop_reason: "end_turn",
+        output_token_count: 0,
+        backend_reported_usage: false,
+    };
+    let mut outer_buf = e2e_crypto::StreamChunkBuffer::new();
+    let mut sse_parser = SseEventParser::new();
+    let mut stream_key: Option<Vec<u8>> = None;
+    let mut done = false;
+    let mut fatal_error = false;
+
+    log::debug!("🌊 Begin processing E2E stream");
+    while let Some(item) = bytes_stream.next().await {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                log::debug!("❌ Error reading chunk from E2E stream");
+                break;
+            }
+        };
+
+        outer_buf.push(&chunk);
+        for event in outer_buf.drain() {
+            match handle_e2e_outer_event(
+                &event,
+                &mut stream_key,
+                &response_secret_key,
+                &mut sse_parser,
+                &tx,
+                &mut stream_state,
+            )
+            .await
+            {
+                StreamPayloadOutcome::Continue => {}
+                StreamPayloadOutcome::Done => {
+                    done = true;
+                    break;
+                }
+                StreamPayloadOutcome::FatalError => {
+                    done = true;
+                    fatal_error = true;
+                    break;
+                }
+                StreamPayloadOutcome::ClientDisconnected => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+
+        if fatal_error || done {
+            break;
+        }
+    }
+
+    // Flush trailing events on both layers (outer E2E wrapper, inner SSE).
+    if !done {
+        if let Some(event) = outer_buf.flush() {
+            match handle_e2e_outer_event(
+                &event,
+                &mut stream_key,
+                &response_secret_key,
+                &mut sse_parser,
+                &tx,
+                &mut stream_state,
+            )
+            .await
+            {
+                StreamPayloadOutcome::Continue | StreamPayloadOutcome::Done => {}
+                StreamPayloadOutcome::FatalError => {
+                    fatal_error = true;
+                }
+                StreamPayloadOutcome::ClientDisconnected => {}
+            }
+        }
+        if let Some(payload) = sse_parser.flush() {
+            let data = payload.trim();
+            match process_backend_sse_payload(&tx, &mut stream_state, data).await {
+                StreamPayloadOutcome::Continue | StreamPayloadOutcome::Done => {}
+                StreamPayloadOutcome::FatalError => {
+                    fatal_error = true;
+                }
+                StreamPayloadOutcome::ClientDisconnected => {}
+            }
+        }
+    }
+
+    // Close any open blocks and finish message
+    if stream_state.thinking_open {
+        let ev = json!({ "type":"content_block_stop", "index":stream_state.thinking_index });
+        let _ = tx
+            .send(
+                Event::default()
+                    .event("content_block_stop")
+                    .data(ev.to_string()),
+            )
+            .await;
+        log::info!(
+            "🧠 OUTPUT: Closed thinking block at end (index={})",
+            stream_state.thinking_index
+        );
+    }
+    if stream_state.text_open {
+        let ev = json!({ "type":"content_block_stop", "index":stream_state.text_index });
+        let _ = tx
+            .send(
+                Event::default()
+                    .event("content_block_stop")
+                    .data(ev.to_string()),
+            )
+            .await;
+    }
+    for tb in stream_state.tools.values() {
+        let stop = json!({ "type":"content_block_stop", "index":tb.block_index });
+        let _ = tx
+            .send(
+                Event::default()
+                    .event("content_block_stop")
+                    .data(stop.to_string()),
+            )
+            .await;
+    }
+
+    let md = json!({
+        "type":"message_delta",
+        "delta":{"stop_reason":stream_state.final_stop_reason,"stop_sequence":null},
+        "usage":{"output_tokens":stream_state.output_token_count}
+    });
+    if tx
+        .send(Event::default().event("message_delta").data(md.to_string()))
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before message_delta");
+        return;
+    }
+
+    if tx
+        .send(
+            Event::default()
+                .event("message_stop")
+                .data(json!({"type":"message_stop"}).to_string()),
+        )
+        .await
+        .is_err()
+    {
+        log::debug!("🔌 Client disconnected before message_stop");
+        return;
+    }
+
+    log::debug!("🏁 E2E streaming task completed");
+
+    // Drain any remaining bytes from the E2E stream to avoid cancelling it.
+    log::debug!("🔄 Draining remaining E2E stream...");
+    let mut drained_bytes = 0;
+    while let Some(item) = bytes_stream.next().await {
+        drained_bytes += item.unwrap_or_default().len();
+    }
+    if drained_bytes > 0 {
+        log::debug!(
+            "🔄 Drained {} additional bytes from E2E stream",
+            drained_bytes
+        );
+    } else {
+        log::debug!("✅ E2E stream was already fully consumed");
+    }
+
+    // Record circuit breaker success if no fatal error
+    if !fatal_error {
+        let cb_clone = circuit_breaker.clone();
+        tokio::spawn(async move {
+            cb_clone.write().await.record_success();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2133,6 +2731,8 @@ mod tests {
             client: reqwest::Client::new(),
             backend_url,
             backend_host_header: None,
+            e2e_enabled: false,
+            e2e_api_base: "https://api.chutes.ai".into(),
             models_cache: Arc::new(RwLock::new(None)),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState {
                 consecutive_failures: if circuit_open { 5 } else { 0 },
@@ -3221,6 +3821,7 @@ mod tests {
             input_price_usd: None,
             output_price_usd: None,
             supported_features: vec!["thinking".into()],
+            chute_id: None,
         }]);
 
         let request = request_from_value(json!({
@@ -3284,6 +3885,7 @@ mod tests {
             input_price_usd: None,
             output_price_usd: None,
             supported_features: vec!["thinking".into()],
+            chute_id: None,
         }]);
 
         let request = request_from_value(json!({
@@ -6325,6 +6927,7 @@ mod tests {
             input_price_usd: None,
             output_price_usd: None,
             supported_features: vec!["extended_thinking".into()],
+            chute_id: None,
         }]);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
@@ -7663,5 +8266,563 @@ mod tests {
             .unwrap();
         let (status, _body) = response_text(r).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // E2E wiring tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Build an App with E2E enabled (e2e_api_base + models cache supplied).
+    fn test_app_e2e(
+        backend_url: String,
+        e2e_api_base: String,
+        models: Vec<crate::models::ModelInfo>,
+    ) -> App {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        App {
+            client: reqwest::Client::new(),
+            backend_url,
+            backend_host_header: None,
+            e2e_enabled: true,
+            e2e_api_base,
+            models_cache: Arc::new(RwLock::new(Some(models))),
+            circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState::new(false))),
+        }
+    }
+
+    /// A TEE model entry for the models cache.
+    fn tee_model_info() -> crate::models::ModelInfo {
+        crate::models::ModelInfo {
+            id: "Vendor/Foo-TEE".into(),
+            input_price_usd: None,
+            output_price_usd: None,
+            supported_features: vec![],
+            chute_id: Some("chute-foo-tee-1".into()),
+        }
+    }
+
+    /// Server-side helper: encrypt an OpenAI completion JSON as a non-streaming
+    /// E2E response blob against the client's `e2e_response_pk`.
+    fn e2e_encrypt_non_streaming(resp_pk: &[u8], resp_json: &Value) -> Vec<u8> {
+        use crate::e2ee::crypto;
+        let (mlkem_ct, shared) = crypto::encapsulate_against_server_pubkey(resp_pk).unwrap();
+        let salt = &mlkem_ct[..16];
+        let key = crypto::hkdf_sha256(&shared, salt, crypto::HKDF_INFO_RESPONSE).unwrap();
+        let compressed = crypto::gzip_compress(resp_json.to_string().as_bytes()).unwrap();
+        let nonce = crypto::random_bytes(12);
+        let ct = crypto::chacha20poly1305_seal(&key, &nonce, &compressed, b"").unwrap();
+        let (c, t) = ct.split_at(ct.len() - 16);
+        crypto::build_request_blob(&mlkem_ct, &nonce, c, t)
+    }
+
+    /// Server-side helper: build the encrypted E2E SSE body (e2e_init + e2e
+    /// frames wrapping inner OpenAI `data:` events) for a streaming invoke.
+    fn e2e_encrypt_streaming_body(resp_pk: &[u8], inner_sse_events: &[String]) -> String {
+        use crate::e2ee::crypto;
+        use crate::e2ee::discovery::base64_encode;
+        let (init_ct, shared) = crypto::encapsulate_against_server_pubkey(resp_pk).unwrap();
+        let salt = &init_ct[..16];
+        let stream_key = crypto::hkdf_sha256(&shared, salt, crypto::HKDF_INFO_STREAM).unwrap();
+        let mut out = format!(
+            "data: {{\"e2e_init\": \"{}\"}}\n\n",
+            base64_encode(&init_ct)
+        );
+        for event in inner_sse_events {
+            let nonce = crypto::random_bytes(12);
+            let ct =
+                crypto::chacha20poly1305_seal(&stream_key, &nonce, event.as_bytes(), b"").unwrap();
+            let frame = [nonce.as_slice(), ct.as_slice()].concat();
+            out.push_str(&format!(
+                "data: {{\"e2e\": \"{}\"}}\n\n",
+                base64_encode(&frame)
+            ));
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    /// A full ML-KEM E2E mock backend:
+    /// - GET  /e2e/instances/:chute_id → instance pool + nonce pool
+    /// - POST /e2e/invoke → decrypts the request, re-encrypts a canned
+    ///   OpenAI response (non-streaming blob or encrypted SSE body).
+    ///
+    /// Returns (api_base, instances_hits, invoke_hits).
+    async fn spawn_e2e_mock(
+        resp_json: Value,
+        stream_body: Option<Vec<String>>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use crate::e2ee::crypto;
+        use crate::e2ee::discovery::base64_encode;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::sync::Mutex;
+
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = base64_encode(&server_kp.public_key);
+        let server_sk = Arc::new(Mutex::new(server_kp.secret_key.clone()));
+
+        let instances_hits = Arc::new(AtomicU32::new(0));
+        let invoke_hits = Arc::new(AtomicU32::new(0));
+
+        let instances_body = json!({
+            "instances": [{
+                "instance_id": "inst-wire-1",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["n1", "n2", "n3", "n4"]
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let instances_hits_c = instances_hits.clone();
+        let invoke_hits_c = invoke_hits.clone();
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = instances_body.clone();
+                    let hits = instances_hits_c.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(body)
+                    }
+                }),
+            )
+            .route(
+                "/e2e/invoke",
+                post(move |_headers: HeaderMap, body: axum::body::Bytes| {
+                    let sk = server_sk.clone();
+                    let hits = invoke_hits_c.clone();
+                    let resp_json = resp_json.clone();
+                    let stream_body = stream_body.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let sk = sk.lock().await;
+                        let req_plaintext = crypto::decrypt_request_blob(&sk, &body).unwrap();
+                        let req_json: Value = serde_json::from_slice(&req_plaintext).unwrap();
+                        let resp_pk_b64 = req_json["e2e_response_pk"].as_str().unwrap();
+                        let resp_pk = crate::e2ee::discovery::base64_decode(resp_pk_b64).unwrap();
+                        match &stream_body {
+                            Some(events) => {
+                                let body = e2e_encrypt_streaming_body(&resp_pk, events);
+                                (
+                                    StatusCode::OK,
+                                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                    body,
+                                )
+                                    .into_response()
+                            }
+                            None => {
+                                let blob = e2e_encrypt_non_streaming(&resp_pk, &resp_json);
+                                (
+                                    StatusCode::OK,
+                                    [(
+                                        axum::http::header::CONTENT_TYPE,
+                                        "application/octet-stream",
+                                    )],
+                                    blob,
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{addr}"), instances_hits, invoke_hits)
+    }
+
+    /// E2E mock whose invoke fails the FIRST request with a 403 nonce error,
+    /// then behaves like the normal mock — exercises the silent nonce retry.
+    async fn spawn_e2e_mock_nonce_403_once() -> (
+        String,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use crate::e2ee::crypto;
+        use crate::e2ee::discovery::base64_encode;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::sync::Mutex;
+
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = base64_encode(&server_kp.public_key);
+        let server_sk = Arc::new(Mutex::new(server_kp.secret_key.clone()));
+
+        let instances_hits = Arc::new(AtomicU32::new(0));
+        let invoke_hits = Arc::new(AtomicU32::new(0));
+        let instances_body = json!({
+            "instances": [{
+                "instance_id": "inst-wire-retry",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["n1", "n2", "n3", "n4"]
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let instances_hits_c = instances_hits.clone();
+        let invoke_hits_c = invoke_hits.clone();
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = instances_body.clone();
+                    let hits = instances_hits_c.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(body)
+                    }
+                }),
+            )
+            .route(
+                "/e2e/invoke",
+                post(move |_headers: HeaderMap, body: axum::body::Bytes| {
+                    let sk = server_sk.clone();
+                    let hits = invoke_hits_c.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            // First attempt: 403 nonce rejection → silent retry.
+                            return (
+                                StatusCode::FORBIDDEN,
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                serde_json::to_vec(
+                                    &serde_json::json!({"detail": "nonce expired or invalid"}),
+                                )
+                                .unwrap(),
+                            )
+                                .into_response();
+                        }
+                        let sk = sk.lock().await;
+                        let req_plaintext = crypto::decrypt_request_blob(&sk, &body).unwrap();
+                        let req_json: Value = serde_json::from_slice(&req_plaintext).unwrap();
+                        let resp_pk_b64 = req_json["e2e_response_pk"].as_str().unwrap();
+                        let resp_pk = crate::e2ee::discovery::base64_decode(resp_pk_b64).unwrap();
+                        let blob =
+                            e2e_encrypt_non_streaming(&resp_pk, &serde_json::json!({"ok": true}));
+                        (
+                            StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            blob,
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{addr}"), instances_hits, invoke_hits)
+    }
+
+    /// E2E mock whose discovery endpoint always 404s — exercises fallback.
+    async fn spawn_e2e_mock_discovery_404() -> (String, Arc<std::sync::atomic::AtomicU32>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let instances_hits = Arc::new(AtomicU32::new(0));
+        let hits_c = instances_hits.clone();
+        let app = Router::new().route(
+            "/e2e/instances/:chute_id",
+            get(move || {
+                let hits = hits_c.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"detail": "chute not found"})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{addr}"), instances_hits)
+    }
+
+    /// e2e_enabled=false + -TEE model → plain passthrough (router parity).
+    #[tokio::test]
+    async fn test_messages_e2e_disabled_tee_model_uses_passthrough() {
+        crate::test_log::init_test_logger();
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app(backend_url, false); // e2e_enabled = false
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK, "passthrough should succeed");
+        assert_eq!(
+            captured.read().await.len(),
+            1,
+            "plain backend must have been hit exactly once"
+        );
+        assert_eq!(captured.read().await[0]["model"], json!("Vendor/Foo-TEE"));
+    }
+
+    /// e2e_enabled=true + plain (non-TEE) model → plain passthrough, E2E untouched.
+    #[tokio::test]
+    async fn test_messages_e2e_enabled_plain_model_passthrough() {
+        use std::sync::atomic::Ordering;
+        crate::test_log::init_test_logger();
+        let (e2e_base, instances_hits, _invoke_hits) =
+            spawn_e2e_mock(json!({"unused": true}), None).await;
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app_e2e(backend_url, e2e_base, vec![tee_model_info()]);
+        let request = request_from_value(json!({
+            "model": "zai-org/GLM-4.5-Air",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            captured.read().await.len(),
+            1,
+            "plain backend must have been hit"
+        );
+        assert_eq!(
+            instances_hits.load(Ordering::SeqCst),
+            0,
+            "E2E discovery must NOT be touched for a plain model"
+        );
+    }
+
+    /// e2e_enabled=true + -TEE model → E2E path called end-to-end
+    /// (discovery acquire → attestation (permissive) → encrypt → decrypt → Claude JSON).
+    #[tokio::test]
+    async fn test_messages_e2e_enabled_tee_model_non_streaming() {
+        use std::sync::atomic::Ordering;
+        crate::test_log::init_test_logger();
+
+        let oai_completion = json!({
+            "id": "chatcmpl-e2e",
+            "object": "chat.completion",
+            "model": "Vendor/Foo-TEE",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hello from the TEE" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9 }
+        });
+        let (e2e_base, instances_hits, invoke_hits) = spawn_e2e_mock(oai_completion, None).await;
+
+        // The plain backend must never be touched.
+        let plain_url = unused_backend_url().await;
+        let app = test_app_e2e(plain_url, e2e_base, vec![tee_model_info()]);
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            instances_hits.load(Ordering::SeqCst),
+            1,
+            "E2E discovery must have been called (acquire)"
+        );
+        assert_eq!(
+            invoke_hits.load(Ordering::SeqCst),
+            1,
+            "E2E invoke must have been called"
+        );
+        // The decrypted OpenAI completion translated to Claude Messages format.
+        assert_eq!(parsed["type"], "message");
+        assert_eq!(parsed["role"], "assistant");
+        assert_eq!(parsed["content"][0]["type"], "text");
+        assert_eq!(parsed["content"][0]["text"], "Hello from the TEE");
+        assert_eq!(parsed["stop_reason"], "end_turn");
+        assert_eq!(parsed["model"], "Vendor/Foo-TEE");
+    }
+
+    /// e2e_enabled=true + -TEE model + stream=true → encrypted SSE → Claude SSE.
+    #[tokio::test]
+    async fn test_messages_e2e_enabled_tee_model_streaming() {
+        use std::sync::atomic::Ordering;
+        crate::test_log::init_test_logger();
+
+        let inner_events = vec![
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "id": "chatcmpl-e2e-s",
+                    "object": "chat.completion.chunk",
+                    "model": "Vendor/Foo-TEE",
+                    "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Value::Null }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "id": "chatcmpl-e2e-s",
+                    "object": "chat.completion.chunk",
+                    "model": "Vendor/Foo-TEE",
+                    "choices": [{ "index": 0, "delta": { "content": "Streamed from the TEE" }, "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
+                })
+            ),
+        ];
+        let (e2e_base, instances_hits, invoke_hits) =
+            spawn_e2e_mock(json!({"unused": true}), Some(inner_events)).await;
+
+        let plain_url = unused_backend_url().await;
+        let app = test_app_e2e(plain_url, e2e_base, vec![tee_model_info()]);
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": true
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(invoke_hits.load(Ordering::SeqCst), 1);
+        assert!(instances_hits.load(Ordering::SeqCst) >= 1);
+        assert!(body.contains("event: message_start"), "body: {body}");
+        assert!(body.contains("Streamed from the TEE"), "body: {body}");
+        assert!(body.contains("event: message_stop"), "body: {body}");
+    }
+
+    /// e2e_enabled=true + -TEE model, E2E discovery fails → fall back to plain HTTP.
+    #[tokio::test]
+    async fn test_messages_e2e_falls_back_on_discovery_failure() {
+        use std::sync::atomic::Ordering;
+        crate::test_log::init_test_logger();
+
+        let (e2e_base, instances_hits) = spawn_e2e_mock_discovery_404().await;
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app_e2e(backend_url, e2e_base, vec![tee_model_info()]);
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "fallback passthrough should succeed"
+        );
+        assert_eq!(
+            instances_hits.load(Ordering::SeqCst),
+            1,
+            "E2E discovery was attempted (and 404'd)"
+        );
+        assert_eq!(
+            captured.read().await.len(),
+            1,
+            "plain backend must have been hit by the fallback"
+        );
+        assert_eq!(captured.read().await[0]["model"], json!("Vendor/Foo-TEE"));
+    }
+
+    /// Silent retry on a 403 nonce rejection: first invoke 403s, second succeeds.
+    #[tokio::test]
+    async fn test_messages_e2e_silent_retry_on_nonce_403() {
+        use std::sync::atomic::Ordering;
+        crate::test_log::init_test_logger();
+
+        let (e2e_base, instances_hits, invoke_hits) = spawn_e2e_mock_nonce_403_once().await;
+        let plain_url = unused_backend_url().await;
+        let app = test_app_e2e(plain_url, e2e_base, vec![tee_model_info()]);
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK, "silent retry must recover");
+        assert_eq!(
+            invoke_hits.load(Ordering::SeqCst),
+            2,
+            "invoke must have been attempted exactly twice (403 → retry)"
+        );
+        // Discovery: first acquire + refresh after invalidate.
+        assert!(
+            instances_hits.load(Ordering::SeqCst) >= 2,
+            "discovery refreshed after the nonce 403"
+        );
+    }
+
+    /// TEE model absent from the models cache (no chute_id) → E2E fails early
+    /// and falls back to plain passthrough.
+    #[tokio::test]
+    async fn test_messages_e2e_missing_chute_id_falls_back() {
+        crate::test_log::init_test_logger();
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        // Models cache is EMPTY (no chute_id for the TEE model).
+        let app = test_app_e2e(backend_url, "http://127.0.0.1:9".into(), vec![]);
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            captured.read().await.len(),
+            1,
+            "plain backend must have been hit by the fallback"
+        );
     }
 }

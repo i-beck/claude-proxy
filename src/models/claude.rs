@@ -43,7 +43,7 @@ impl ThinkingConfig {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ClaudeImageSource {
     #[serde(rename = "type")]
     #[allow(dead_code)]
@@ -52,7 +52,7 @@ pub struct ClaudeImageSource {
     pub data: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ClaudeDocumentSource {
     #[serde(rename = "type")]
     #[allow(dead_code)]
@@ -67,7 +67,7 @@ pub struct ClaudeDocumentSource {
     pub file_id: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ClaudeContentBlock {
     #[serde(rename = "text")]
@@ -125,13 +125,13 @@ pub enum ClaudeContentBlock {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ClaudeMessage {
     pub role: String,
     pub content: Value, // String or Vec<ClaudeContentBlock>
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ClaudeTool {
     pub name: String,
     #[serde(default)]
@@ -139,7 +139,7 @@ pub struct ClaudeTool {
     pub input_schema: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ClaudeRequest {
     pub model: String,
     pub messages: Vec<ClaudeMessage>,
@@ -173,7 +173,7 @@ pub struct ClaudeRequest {
     pub service_tier: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Default, Clone)]
 pub struct ClaudeOutputConfig {
     #[serde(default, alias = "effortLevel")]
     pub effort: Option<String>,

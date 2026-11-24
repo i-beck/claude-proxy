@@ -36,6 +36,7 @@ mod tests {
             input_price_usd: None,
             output_price_usd: None,
             supported_features: vec![],
+            chute_id: None,
         }]);
 
         let normalized = normalize_model_name("zai-org/GLM-4.5-Air", &cache).await;
@@ -49,6 +50,7 @@ mod tests {
             input_price_usd: None,
             output_price_usd: None,
             supported_features: vec![],
+            chute_id: None,
         }]);
 
         let normalized = normalize_model_name("zai-org/glm-4.5-air", &cache).await;
@@ -62,6 +64,7 @@ mod tests {
             input_price_usd: None,
             output_price_usd: None,
             supported_features: vec![],
+            chute_id: None,
         }]);
 
         let normalized = normalize_model_name("missing-model", &cache).await;

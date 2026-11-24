@@ -182,12 +182,14 @@ mod tests {
                 input_price_usd: Some(0.1),
                 output_price_usd: Some(0.2),
                 supported_features: vec![],
+                chute_id: None,
             },
             ModelInfo {
                 id: "deepseek-r1".into(),
                 input_price_usd: Some(0.2),
                 output_price_usd: Some(0.4),
                 supported_features: vec!["reasoning".into()],
+                chute_id: None,
             },
         ];
 
@@ -256,12 +258,14 @@ mod tests {
                 input_price_usd: Some(0.1),
                 output_price_usd: Some(0.2),
                 supported_features: vec![],
+                chute_id: None,
             },
             ModelInfo {
                 id: "model-b".into(),
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec!["reasoning".into()],
+                chute_id: None,
             },
         ];
         let content = build_model_list_content("test", &models);
@@ -278,12 +282,14 @@ mod tests {
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec![],
+                chute_id: None,
             },
             ModelInfo {
                 id: "org/aaa".into(),
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec![],
+                chute_id: None,
             },
         ];
         let content = build_model_list_content("test", &models);
@@ -301,6 +307,7 @@ mod tests {
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec![],
+                chute_id: None,
             })
             .collect();
         let content = build_model_list_content("test", &models);
@@ -329,6 +336,7 @@ mod tests {
             input_price_usd: Some(0.2),
             output_price_usd: Some(0.4),
             supported_features: vec!["reasoning".into()],
+            chute_id: None,
         }];
         let content = build_model_list_content("missing", &models);
         assert!(content.contains("REASONING"));
@@ -343,6 +351,7 @@ mod tests {
             input_price_usd: Some(0.1),
             output_price_usd: Some(0.2),
             supported_features: vec![],
+            chute_id: None,
         }];
         let content = build_model_list_content("missing", &models);
         assert!(!content.contains("REASONING"));
@@ -365,18 +374,21 @@ mod tests {
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec![],
+                chute_id: None,
             },
             ModelInfo {
                 id: "b/model2".into(),
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec![],
+                chute_id: None,
             },
             ModelInfo {
                 id: "c/model3".into(),
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec![],
+                chute_id: None,
             },
         ];
         let content = build_model_list_content("missing", &models);
@@ -411,12 +423,14 @@ mod tests {
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec!["reasoning".into()],
+                chute_id: None,
             },
             ModelInfo {
                 id: "zai-org/GLM-Alpha".into(),
                 input_price_usd: None,
                 output_price_usd: None,
                 supported_features: vec!["reasoning".into()],
+                chute_id: None,
             },
         ];
         let content = build_model_list_content("missing", &models);
