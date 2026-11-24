@@ -3633,6 +3633,148 @@ mod tests {
 
     /// Mock-PCS fetch of the collateral success arm: deterministic offline
     /// coverage for `fetch_intel_pcs_collateral` → parser → DcapCollateral.
+    // ── fetch_attestation_nonce mock-server tests (`/instances/nonce`) ─────
+    //
+    // `fetch_attestation_nonce` is the user-reachable nonce path used by the
+    // `use_evidence` flow; prior to these tests it had NO offline coverage
+    // (only `#[ignore]`d live tests exercised it). A mock `/instances/nonce`
+    // endpoint lets the parse + error paths run deterministically offline.
+
+    /// Spin up a mock `/instances/nonce` endpoint returning the given body +
+    /// status, and return its base URL.
+    async fn start_mock_nonce_server(
+        body: String,
+        status: u16,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/instances/nonce",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move {
+                    use axum::http::StatusCode;
+                    use axum::response::IntoResponse;
+                    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+                    (code, [("content-type", "application/json")], body).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_attestation_nonce_valid_mock() {
+        // The real endpoint returns a bare JSON string; serve a valid 64-hex one.
+        let nonce = new_attestation_nonce();
+        let body = format!("\"{nonce}\"");
+        let (base_url, handle) = start_mock_nonce_server(body, 200).await;
+        let client = reqwest::Client::new();
+        let got = fetch_attestation_nonce(&client, &base_url, "test-key")
+            .await
+            .expect("valid nonce should parse");
+        assert_eq!(got, nonce);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_attestation_nonce_error_status() {
+        let (base_url, handle) = start_mock_nonce_server("\"x\"".into(), 500).await;
+        let client = reqwest::Client::new();
+        let err = fetch_attestation_nonce(&client, &base_url, "test-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Status(500, _)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_attestation_nonce_wrong_length() {
+        // 32 hex chars (16 bytes) — valid hex but wrong length → Malformed.
+        let (base_url, handle) = start_mock_nonce_server("\"a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4\"".into(), 200).await;
+        let client = reqwest::Client::new();
+        let err = fetch_attestation_nonce(&client, &base_url, "test-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Malformed(_)));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_attestation_nonce_non_hex() {
+        // 64 chars but not hex digits → Malformed.
+        let body = format!("\"{}\"", "z".repeat(64));
+        let (base_url, handle) = start_mock_nonce_server(body, 200).await;
+        let client = reqwest::Client::new();
+        let err = fetch_attestation_nonce(&client, &base_url, "test-key")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Malformed(_)));
+        handle.abort();
+    }
+
+    // ── fetch_quote_from_chutes_api (quote-only variant) offline tests ──────
+    //
+    // `fetch_quote_from_chutes_api` is the quote-only evidence helper; the
+    // handler uses `fetch_quote_with_cert`, so this variant had no offline
+    // coverage. Drive it against the same mock evidence server.
+
+    #[tokio::test]
+    async fn test_fetch_quote_from_chutes_api_mock() {
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/evidence_response.json"
+        ))
+        .unwrap();
+        let (base_url, handle) = start_mock_evidence_server(body, 200).await;
+        let client = reqwest::Client::new();
+        let quote = fetch_quote_from_chutes_api(&client, &base_url, "test-key", "inst-1", "nonce-abc-123")
+            .await
+            .expect("quote-only fetch should succeed");
+        assert_eq!(
+            quote,
+            include_bytes!("../../tests/fixtures/evidence_quote.bin")
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_quote_from_chutes_api_missing_quote_error() {
+        let body = serde_json::json!({"certificate": EVIDENCE_CERT_B64});
+        let (base_url, handle) = start_mock_evidence_server(body, 200).await;
+        let client = reqwest::Client::new();
+        let err = fetch_quote_from_chutes_api(&client, &base_url, "test-key", "inst-1", "n")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttestationFetchError::Malformed(_)));
+        handle.abort();
+    }
+
+    // ── MeasurementOverride::from_config_file malformed-JSON arm (L488) ─────
+
+    #[test]
+    fn test_measurement_override_from_config_file_invalid_json_returns_err() {
+        // A file that exists but is NOT valid JSON → io::Error InvalidData,
+        // covering the `.map_err` conversion at from_config_file L488.
+        let dir = std::env::temp_dir();
+        let path = dir.join("claude_proxy_attest_override_test_invalid.json");
+        std::fs::write(&path, "this is not valid json {{ }").expect("write temp");
+        let result =
+            MeasurementOverride::from_config_file(path.to_str().expect("path str"));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "invalid JSON should return an error");
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "error kind should map serde error to InvalidData"
+        );
+    }
+
     #[tokio::test]
     async fn test_fetch_intel_pcs_collateral_mock_server() {
         let quote = include_bytes!("../../tests/fixtures/live_tdx_quote.bin").to_vec();
