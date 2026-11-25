@@ -44,6 +44,7 @@ mod tests {
             backend_host_header: None,
             e2e_enabled: false,
             e2e_api_base: "https://api.chutes.ai".into(),
+            node_ip: None,
             models_cache: Arc::new(RwLock::new(Some(
                 (0..cached_models)
                     .map(|idx| ModelInfo {
@@ -74,6 +75,7 @@ mod tests {
             backend_host_header: None,
             e2e_enabled: false,
             e2e_api_base: "https://api.chutes.ai".into(),
+            node_ip: None,
             models_cache: Arc::new(RwLock::new(Some(
                 (0..cached_models)
                     .map(|idx| ModelInfo {

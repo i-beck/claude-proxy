@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.15] - 2026-11-25
+
+### Added
+- **Miner attestation via `CHUTES_MINER_IP`** - Optional operator-supplied env
+  var carries the miner's public IP into the proxy. When set, the E2E
+  attestation path fetches a live TDX quote from
+  `https://{CHUTES_MINER_IP}:30443/server/attest` and verifies it first. When
+  unset, the proxy skips the miner hop and uses the user-reachable evidence
+  endpoint (`use_evidence`).
+- **4 attestation-fallback integration tests** - Cover all four fallbacks in
+  `messages.rs`: node_ip down + evidence OK, node_ip down + evidence 500, no
+  node_ip + evidence 500, and attestation+invoke failure → plain HTTP.
+
+### Changed
+- **`node_ip` plumbed through `RuntimeConfig` → `App` → `messages.rs`** - The
+  value now flows from `CHUTES_MINER_IP` through `build_app` into the E2E
+  request path (`e2e_request_attested`).
+- **README updated** - Document the live E2E wiring (d41bc10) and this commit's
+  `node_ip` plumbed path; configuration table now lists `E2E_ENABLED`,
+  `E2E_API_BASE`, and `CHUTES_MINER_IP`; test count updates.
+
+## [0.1.14] - 2026-11-24
+
+### Added
+- **E2E module wired into the request path** (commit `d41bc10`) - `E2E_ENABLED`
+  is parsed into `RuntimeConfig`, threaded through `build_app` into `App`, and
+  consumed by `messages.rs`; requests for `-TEE` models now route through the
+  encrypted, attested E2E channel when the flag is `true`.
+
 ## [0.1.10] - 2025-11-19
 
 ### Changed

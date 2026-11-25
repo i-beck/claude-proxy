@@ -8,11 +8,11 @@ TEE models** with **Intel TDX attestation verification**.
 Two things to know up front:
 
 - The translation layer is the live, shipped path. It is what `cargo run` serves.
-- The E2E + TDX-attestation module (`src/e2ee/`) is **fully implemented and
-  tested, but not yet wired into the proxy's request path**. It is exercised by
-  the test suite (unit, integration, and live smoke tests), not by the running
-  binary. See [Status of the E2E module](#status-of-the-e2e-module) for the exact
-  wiring gap.
+- The E2E + TDX-attestation module (`src/e2ee/`) is **fully implemented, tested,
+  and wired into the proxy's request path** behind the `E2E_ENABLED` flag. When
+  the flag is on and a request targets a `-TEE` model, the running binary routes
+  it through the encrypted, attested E2E channel. See
+  [Status of the E2E module](#status-of-the-e2e-module) for what the flag does.
 
 The original `claude-proxy` only did protocol translation. The `src/e2ee/` module
 adds: encrypting requests to TEE models and verifying that those models are
@@ -70,6 +70,10 @@ The `src/e2ee/` module is complete and covered by the test suite:
 - **TDX quote parsing + measurement pinning** (`attestation.rs`) — parses a raw
   TDX quote (MRTD / RTMR0-3 / REPORTDATA), pins measurements per guest image
   version (`attestation.rs:120`), and verifies key binding.
+- **Miner attestation via `node_ip`** (`handler.rs`, `messages.rs`) — when the
+  operator supplies `CHUTES_MINER_IP`, the proxy fetches a live TDX quote from
+  the miner's attestation service (`https://{node_ip}:30443/server/attest`) and
+  verifies it before falling back to the evidence endpoint.
 - **Evidence endpoint integration** (`attestation.rs:1215`) — fetches a live TDX
   quote + TEE certificate from the user-reachable
   `GET /instances/{id}/evidence?nonce=` endpoint.
@@ -88,30 +92,27 @@ The `src/e2ee/` module is complete and covered by the test suite:
   `attestation.rs:330`), and strict-mode retry on network error only
   (`handler.rs:353`, `handler.rs:391`, `attestation.rs:316`).
 
-### What is NOT wired (the gap)
+### How it is wired (as of d41bc10)
 
-`E2E_ENABLED` is parsed into `RuntimeConfig` (`main.rs:30`, `main.rs:52`,
-default `false` at `main.rs:54`), but **that flag is never consumed**:
+`E2E_ENABLED` is parsed into `RuntimeConfig` (`main.rs`) and threaded through
+`build_app` into `App` (`app.rs`). When the flag is `true` and a request targets
+a `-TEE` model, the request path in `src/handlers/messages.rs` calls
+`e2e_request_attested` (`handler.rs`) — discovery, attestation, encryption,
+decryption, and translation to the Claude Messages response.
 
-- `build_app` / `build_router` do not read it (`main.rs:59-88`).
-- `App` carries no E2E field (`app.rs:18-24`).
-- `e2ee::` is referenced **zero times** outside `src/e2ee/` — the request path
-  in `src/handlers/messages.rs` never calls into the module.
+Miner attestation via `node_ip` (this commit) is wired the same way: the
+operator passes the miner's public IP via env `CHUTES_MINER_IP`; the proxy then
+tries `https://{node_ip}:30443/server/attest` first for a live TDX quote, and
+falls back to the user-reachable evidence endpoint (`use_evidence`) if the miner
+hop is unreachable or returns an error. See
+[Configuration](#configuration) for the env var and
+[The E2E module, file by file](#the-e2e-module,-file-by-file) for the attestation
+chain the fallback paths join.
 
-So today the E2E module is a **library component exercised by the test suite**,
-not a feature the running binary activates. `E2E_ENABLED=true` is the *intended*
-opt-in switch (the design is opt-in, not default), but turning it on does not
-currently change proxy behavior because the wiring is not in place. This is the
-one place the README and the code disagree with the "old plan," and it is stated
-here on purpose.
+### How to exercise the E2E module
 
-To make E2E live, the flag must be threaded through `build_app` into `App` and
-`e2e_request_attested` (`handler.rs:363`) must be called from the request path.
-That wiring is out of scope for this README update.
-
-### How to run the E2E module today
-
-You exercise it through the tests, not the binary:
+Set `E2E_ENABLED=true` and (optionally) `CHUTES_MINER_IP` before starting the
+proxy, then send requests to `-TEE` models. Or run the tests:
 
 ```sh
 # Offline unit + integration tests (no network, no API key):
@@ -150,7 +151,7 @@ HOST_PORT=8080 \
 cargo run --release
 ```
 
-The binary (`claude_openai_proxy`, `Cargo.toml:2-3`, version `0.1.14`) listens on
+The binary (`claude_openai_proxy`, `Cargo.toml:2-3`, version `0.1.15`) listens on
 `HOST_PORT`, which defaults to `8080`.
 
 ### Run With Docker Compose
@@ -265,11 +266,13 @@ All under `src/e2ee/` (declared in `mod.rs:1-7`).
 | `BACKEND_TIMEOUT_SECS` | Backend request timeout | `600` |
 | `ENABLE_CIRCUIT_BREAKER` | Optional backend failure protection | `false` |
 | `RUST_LOG` | Log level | `info` |
-| `E2E_ENABLED` | Intended opt-in switch for the E2E module | `false` |
+| `E2E_ENABLED` | Opt-in switch for the E2E module (routes `-TEE` models through the encrypted, attested channel) | `false` |
+| `E2E_API_BASE` | E2E control-plane base URL (discovery + invoke) | `https://api.chutes.ai` |
+| `CHUTES_MINER_IP` | Optional miner node IP; when set, attestation fetches a live TDX quote from `https://{ip}:30443/server/attest` before failing over to the evidence endpoint | unset |
 
-`E2E_ENABLED` is parsed (`main.rs:52`) but **not yet consumed** — see
-[Status of the E2E module](#status-of-the-e2e-module). The other variables are
-live.
+`E2E_ENABLED` is live as of commit `d41bc10` (`main.rs`, `app.rs`,
+`messages.rs`). `CHUTES_MINER_IP` is threaded the same way; when unset, the
+proxy skips the miner hop and uses the user-reachable evidence endpoint only.
 
 ---
 
@@ -286,7 +289,7 @@ cargo test --all-targets
 
 ### Current test status
 
-- **708 unit/integration tests pass, 0 fail, 15 ignored**
+- **720 unit/integration tests pass, 0 fail, 15 ignored**
   (`cargo test --bin claude_openai_proxy`).
 - The **15 ignored** tests are all live/network tests in `src/e2ee/smoke.rs`
   (8) and `src/e2ee/attestation.rs` (7). They require `CHUTES_API_KEY` and
@@ -309,20 +312,22 @@ More test details live in [tests/README.md](tests/README.md).
 
 ### Coverage
 
-Measured on the current 708-test tree with `cargo llvm-cov --release`:
+Measured on the current 720-test tree with `cargo llvm-cov --release`:
 
 | Scope | Line coverage |
 |---|---|
-| Whole `src/` (incl. the test-only `src/e2ee/`) | **91.88%** (14,769 / 16,074) |
-| `src/` minus `src/e2ee/` (production) | **99.73%** (9,618 / 9,644) |
+| Whole `src/` (incl. the test-only `src/e2ee/`) | **91.98%** (15,899 / 17,286) |
+| `src/` minus `src/e2ee/` (production) | **99.01%** (10,748 / 10,856) |
 | `src/e2ee/` alone (test-only module) | **80.11%** (5,151 / 6,430) |
 
-The whole-repo figure is dragged down by the un-wired, test-only `src/e2ee/`
-module; **production code has not regressed** and sits at 99.73%. When the live
-tests are included (the reproducible "ceiling" run, 5 flaky/unreachable tests
-skipped) the whole-repo figure rises to ~96% (96.32% per the last reproducible
-run documented in `COVERAGE.md`). The `src/e2ee/smoke.rs` file reads 0% in the
-default suite because the entire file is `#[ignore]`d live tests.
+The whole-repo figure is dragged down by the `src/e2ee/` module (which carries
+heavier test/live-only surfaces); the wiring of E2E into the request path
+(`d41bc10`) added ~1,200 lines of new production code, moving the production
+line-coverage baseline from 99.73% → 99.01%. When the live tests are included
+(the reproducible "ceiling" run, 5 flaky/unreachable tests skipped) the
+whole-repo figure rises to ~96% (96.32% per the last reproducible run documented
+in `COVERAGE.md`). The `src/e2ee/smoke.rs` file reads 0% in the default suite
+because the entire file is `#[ignore]`d live tests.
 
 Reproduce:
 

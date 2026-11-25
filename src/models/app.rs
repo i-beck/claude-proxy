@@ -36,6 +36,16 @@ pub struct App {
     /// `https://api.chutes.ai`. Independent of `backend_url`, which points at
     /// the LLM inference endpoint.
     pub e2e_api_base: String,
+    /// Public IP of a miner's TEE worker node, when the operator supplies one
+    /// out-of-band (env `CHUTES_MINER_IP`). When set, the E2E path fetches a
+    /// live TDX quote from the miner's attestation service
+    /// (`https://{node_ip}:30443/server/attest`) and verifies it instead of
+    /// (or in addition to) the user-reachable evidence endpoint. When `None`
+    /// (the default), the miner hop is skipped and the E2E path uses the
+    /// evidence endpoint (`use_evidence`). The raw `:30443/server/attest` hop
+    /// is validator-gated in production, so this is an operator-supplied
+    /// override for deployments that have arranged access.
+    pub node_ip: Option<String>,
 }
 
 // ---------- Circuit breaker state ----------

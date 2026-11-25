@@ -29,6 +29,7 @@ struct RuntimeConfig {
     host_port: u16,
     e2e_enabled: bool,
     e2e_api_base: String,
+    node_ip: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -55,6 +56,7 @@ impl RuntimeConfig {
                 .unwrap_or(false),
             e2e_api_base: get("E2E_API_BASE")
                 .unwrap_or_else(|| crate::e2ee::attestation::CHUTES_API_BASE.into()),
+            node_ip: get("CHUTES_MINER_IP"),
         }
     }
 }
@@ -79,6 +81,7 @@ fn build_app(config: &RuntimeConfig) -> App {
         circuit_breaker,
         e2e_enabled: config.e2e_enabled,
         e2e_api_base: config.e2e_api_base.clone(),
+        node_ip: config.node_ip.clone(),
     }
 }
 
@@ -221,6 +224,7 @@ mod tests {
                 host_port: 8080,
                 e2e_enabled: false,
                 e2e_api_base: "https://api.chutes.ai".into(),
+                node_ip: None,
             }
         );
     }
@@ -248,6 +252,7 @@ mod tests {
                 host_port: 9090,
                 e2e_enabled: true,
                 e2e_api_base: "https://e2e.example.com".into(),
+                node_ip: None,
             }
         );
 
@@ -275,6 +280,7 @@ mod tests {
             host_port: 8080,
             e2e_enabled: false,
             e2e_api_base: "https://api.chutes.ai".into(),
+            node_ip: None,
         };
 
         let app = build_app(&config);

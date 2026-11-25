@@ -2254,8 +2254,16 @@ async fn try_e2e_request(
     let client = app.client.clone();
     let discovery = Discovery::new(client.clone(), app.e2e_api_base.clone());
     let attest = AttestationConfig {
+        // When the operator supplies a miner node IP out-of-band
+        // (`CHUTES_MINER_IP` → `App::node_ip`), the handler fetches a live
+        // TDX quote from the miner's attestation service
+        // (`https://{node_ip}:30443/server/attest`) and verifies it first.
+        // This is the primary attestation source; the evidence endpoint below
+        // is the fallback when the miner hop is unavailable.
+        node_ip: app.node_ip.as_deref(),
         // Fetch a live TDX quote + TEE cert from the user-reachable evidence
-        // endpoint and verify the cert-hash key binding.
+        // endpoint and verify the cert-hash key binding. Used when no miner
+        // node IP is configured or the miner fetch fails (permissive mode).
         use_evidence: true,
         // Permissive: warn + proceed on attestation gaps (the current API
         // carries no pinned-measurement guarantee for every image).
@@ -2679,6 +2687,7 @@ mod tests {
         Json, Router,
     };
     use serde_json::json;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -2733,6 +2742,7 @@ mod tests {
             backend_host_header: None,
             e2e_enabled: false,
             e2e_api_base: "https://api.chutes.ai".into(),
+            node_ip: None,
             models_cache: Arc::new(RwLock::new(None)),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState {
                 consecutive_failures: if circuit_open { 5 } else { 0 },
@@ -8276,6 +8286,7 @@ mod tests {
     fn test_app_e2e(
         backend_url: String,
         e2e_api_base: String,
+        node_ip: Option<String>,
         models: Vec<crate::models::ModelInfo>,
     ) -> App {
         use std::sync::Arc;
@@ -8286,6 +8297,7 @@ mod tests {
             backend_host_header: None,
             e2e_enabled: true,
             e2e_api_base,
+            node_ip,
             models_cache: Arc::new(RwLock::new(Some(models))),
             circuit_breaker: Arc::new(RwLock::new(CircuitBreakerState::new(false))),
         }
@@ -8556,6 +8568,143 @@ mod tests {
         (format!("http://{addr}"), instances_hits)
     }
 
+    /// E2E mock that also serves the user-reachable attestation evidence
+    /// endpoint (`GET /instances/:id/evidence?nonce=...`) used by the
+    /// `use_evidence` fallback when the `node_ip` miner hop is unavailable.
+    /// Returns (api_base, instances_hits, evidence_hits, invoke_hits).
+    ///
+    /// `evidence_body` / `evidence_status` control the evidence endpoint's
+    /// response (a `200` + the real fixture exercises the fallback-success
+    /// path; a non-2xx status exercises the fallback-failure path).
+    /// `invoke_status` controls the `/e2e/invoke` response: `200` re-encrypts
+    /// a canned completion, a non-2xx makes the E2E flow error so the caller
+    /// can observe the plain-HTTP passthrough fallback.
+    async fn spawn_e2e_mock_with_evidence(
+        evidence_body: Value,
+        evidence_status: u16,
+        invoke_status: u16,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use crate::e2ee::crypto;
+        use crate::e2ee::discovery::base64_encode;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::sync::Mutex;
+
+        let server_kp = crypto::generate_response_keypair().unwrap();
+        let server_pk_b64 = base64_encode(&server_kp.public_key);
+        let server_sk = Arc::new(Mutex::new(server_kp.secret_key.clone()));
+
+        let instances_hits = Arc::new(AtomicU32::new(0));
+        let evidence_hits = Arc::new(AtomicU32::new(0));
+        let invoke_hits = Arc::new(AtomicU32::new(0));
+
+        let instances_body = json!({
+            "instances": [{
+                "instance_id": "inst-wire-evidence",
+                "e2e_pubkey": server_pk_b64,
+                "nonces": ["n1", "n2", "n3", "n4"]
+            }],
+            "nonce_expires_in": 60
+        });
+
+        let instances_hits_c = instances_hits.clone();
+        let evidence_hits_c = evidence_hits.clone();
+        let invoke_hits_c = invoke_hits.clone();
+        let app = Router::new()
+            .route(
+                "/e2e/instances/:chute_id",
+                get(move || {
+                    let body = instances_body.clone();
+                    let hits = instances_hits_c.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(body)
+                    }
+                }),
+            )
+            .route(
+                "/instances/:instance_id/evidence",
+                get(move || {
+                    let body = evidence_body.clone();
+                    let hits = evidence_hits_c.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let code =
+                            StatusCode::from_u16(evidence_status).unwrap_or(StatusCode::OK);
+                        (code, Json(body)).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/e2e/invoke",
+                post(move |_headers: HeaderMap, body: axum::body::Bytes| {
+                    let sk = server_sk.clone();
+                    let hits = invoke_hits_c.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if invoke_status != 200 {
+                            let code = StatusCode::from_u16(invoke_status)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                            return (code, Json(json!({"detail": "invoke error"})))
+                                .into_response();
+                        }
+                        let sk = sk.lock().await;
+                        let req_plaintext = crypto::decrypt_request_blob(&sk, &body).unwrap();
+                        let req_json: Value = serde_json::from_slice(&req_plaintext).unwrap();
+                        let resp_pk_b64 = req_json["e2e_response_pk"].as_str().unwrap();
+                        let resp_pk = crate::e2ee::discovery::base64_decode(resp_pk_b64).unwrap();
+                        let blob = e2e_encrypt_non_streaming(
+                            &resp_pk,
+                            &json!({
+                                "id": "chatcmpl-e2e-ev",
+                                "object": "chat.completion",
+                                "model": "Vendor/Foo-TEE",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": { "role": "assistant", "content": "via E2E attested" },
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                            }),
+                        );
+                        (
+                            StatusCode::OK,
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "application/octet-stream",
+                            )],
+                            blob,
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (
+            format!("http://{addr}"),
+            instances_hits,
+            evidence_hits,
+            invoke_hits,
+        )
+    }
+
+    /// The real captured evidence response (quote + cert) so the `use_evidence`
+    /// fallback verifies a genuine cert-hash key binding offline.
+    const EVIDENCE_RESPONSE_JSON: &str =
+        include_str!("../../tests/fixtures/evidence_response.json");
+
     /// e2e_enabled=false + -TEE model → plain passthrough (router parity).
     #[tokio::test]
     async fn test_messages_e2e_disabled_tee_model_uses_passthrough() {
@@ -8591,7 +8740,7 @@ mod tests {
         let (e2e_base, instances_hits, _invoke_hits) =
             spawn_e2e_mock(json!({"unused": true}), None).await;
         let (backend_url, captured) = spawn_capturing_backend().await;
-        let app = test_app_e2e(backend_url, e2e_base, vec![tee_model_info()]);
+        let app = test_app_e2e(backend_url, e2e_base, None, vec![tee_model_info()]);
         let request = request_from_value(json!({
             "model": "zai-org/GLM-4.5-Air",
             "messages": [{ "role": "user", "content": "hi" }],
@@ -8639,7 +8788,7 @@ mod tests {
 
         // The plain backend must never be touched.
         let plain_url = unused_backend_url().await;
-        let app = test_app_e2e(plain_url, e2e_base, vec![tee_model_info()]);
+        let app = test_app_e2e(plain_url, e2e_base, None, vec![tee_model_info()]);
         let request = request_from_value(json!({
             "model": "Vendor/Foo-TEE",
             "messages": [{ "role": "user", "content": "hi" }],
@@ -8704,7 +8853,7 @@ mod tests {
             spawn_e2e_mock(json!({"unused": true}), Some(inner_events)).await;
 
         let plain_url = unused_backend_url().await;
-        let app = test_app_e2e(plain_url, e2e_base, vec![tee_model_info()]);
+        let app = test_app_e2e(plain_url, e2e_base, None, vec![tee_model_info()]);
         let request = request_from_value(json!({
             "model": "Vendor/Foo-TEE",
             "messages": [{ "role": "user", "content": "hi" }],
@@ -8733,7 +8882,7 @@ mod tests {
 
         let (e2e_base, instances_hits) = spawn_e2e_mock_discovery_404().await;
         let (backend_url, captured) = spawn_capturing_backend().await;
-        let app = test_app_e2e(backend_url, e2e_base, vec![tee_model_info()]);
+        let app = test_app_e2e(backend_url, e2e_base, None, vec![tee_model_info()]);
         let request = request_from_value(json!({
             "model": "Vendor/Foo-TEE",
             "messages": [{ "role": "user", "content": "hi" }],
@@ -8772,7 +8921,7 @@ mod tests {
 
         let (e2e_base, instances_hits, invoke_hits) = spawn_e2e_mock_nonce_403_once().await;
         let plain_url = unused_backend_url().await;
-        let app = test_app_e2e(plain_url, e2e_base, vec![tee_model_info()]);
+        let app = test_app_e2e(plain_url, e2e_base, None, vec![tee_model_info()]);
         let request = request_from_value(json!({
             "model": "Vendor/Foo-TEE",
             "messages": [{ "role": "user", "content": "hi" }],
@@ -8805,7 +8954,7 @@ mod tests {
         crate::test_log::init_test_logger();
         let (backend_url, captured) = spawn_capturing_backend().await;
         // Models cache is EMPTY (no chute_id for the TEE model).
-        let app = test_app_e2e(backend_url, "http://127.0.0.1:9".into(), vec![]);
+        let app = test_app_e2e(backend_url, "http://127.0.0.1:9".into(), None, vec![]);
         let request = request_from_value(json!({
             "model": "Vendor/Foo-TEE",
             "messages": [{ "role": "user", "content": "hi" }],
@@ -8823,6 +8972,180 @@ mod tests {
             captured.read().await.len(),
             1,
             "plain backend must have been hit by the fallback"
+        );
+    }
+
+    // ---- node_ip wiring: four attestation fallback paths ----
+
+    /// 1) node_ip is set but the miner's :30443 attestation service is
+    ///    unreachable; the user-reachable evidence endpoint serves a valid
+    ///    quote → permissive mode proceeds via the evidence path and the E2E
+    ///    invoke runs. This is the primary intended fallback: node_ip primary,
+    ///    evidence fallback.
+    #[tokio::test]
+    async fn test_e2e_node_ip_down_evidence_ok_proceeds_via_invoke() {
+        let evidence: Value = serde_json::from_str(EVIDENCE_RESPONSE_JSON).unwrap();
+        let (e2e_base, instances_hits, evidence_hits, invoke_hits) =
+            spawn_e2e_mock_with_evidence(evidence, 200, 200).await;
+        let plain_url = unused_backend_url().await;
+        let app = test_app_e2e(
+            plain_url,
+            e2e_base,
+            Some("127.0.0.1".into()),
+            vec![tee_model_info()],
+        );
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, body) = response_text(response).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            parsed["type"], "message",
+            "expected a Claude Messages response from the E2E path, got: {body}"
+        );
+        assert_eq!(
+            parsed["content"][0]["text"], "via E2E attested",
+            "expected E2E-invoked transcript text, got: {body}"
+        );
+        assert_eq!(
+            invoke_hits.load(Ordering::SeqCst),
+            1,
+            "E2E invoke must have run (attestation proceeded via evidence fallback)"
+        );
+        assert!(
+            evidence_hits.load(Ordering::SeqCst) >= 1,
+            "evidence endpoint must have been queried (node_ip miner hop failed, fell back)"
+        );
+        assert_eq!(
+            instances_hits.load(Ordering::SeqCst),
+            1,
+            "discovery ran once"
+        );
+    }
+
+    /// 2) node_ip miner hop is unreachable AND the evidence endpoint returns
+    ///    500 → with `e2e_attest_strict = false` (Permissive, the messages.rs
+    ///    default) attestation gaps are downgraded to warnings and the E2E
+    ///    invoke still runs.
+    #[tokio::test]
+    async fn test_e2e_node_ip_down_evidence_500_permissive_proceeds_via_invoke() {
+        let (e2e_base, _instances, evidence_hits, invoke_hits) =
+            spawn_e2e_mock_with_evidence(json!({"detail": "evidence error"}), 500, 200).await;
+        let plain_url = unused_backend_url().await;
+        let app = test_app_e2e(
+            plain_url,
+            e2e_base,
+            Some("127.0.0.1".into()),
+            vec![tee_model_info()],
+        );
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            evidence_hits.load(Ordering::SeqCst) >= 1,
+            "evidence endpoint must have been queried"
+        );
+        assert_eq!(
+            invoke_hits.load(Ordering::SeqCst),
+            1,
+            "Permissive mode must still invoke despite node_ip + evidence failures"
+        );
+    }
+
+    /// 3) node_ip is `None` (default) and evidence is unavailable → still
+    ///    permissive, so the E2E invoke runs. Confirms the absence of the
+    ///    miner hop doesn't hard-block the E2E path under the current default.
+    #[tokio::test]
+    async fn test_e2e_no_node_ip_evidence_500_permissive_proceeds_via_invoke() {
+        let (e2e_base, _instances, evidence_hits, invoke_hits) =
+            spawn_e2e_mock_with_evidence(json!({"detail": "evidence error"}), 500, 200).await;
+        let plain_url = unused_backend_url().await;
+        let app = test_app_e2e(plain_url, e2e_base, None, vec![tee_model_info()]);
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            evidence_hits.load(Ordering::SeqCst) >= 1,
+            "evidence endpoint must have been queried even with no node_ip"
+        );
+        assert_eq!(
+            invoke_hits.load(Ordering::SeqCst),
+            1,
+            "Permissive mode must still invoke"
+        );
+    }
+
+    /// 4) Attestation (both hops) fails AND the E2E invoke itself then errors
+    ///    → the handler's `try_e2e_request` falls back to plain HTTP
+    ///    passthrough, so the user's request still completes against the
+    ///    plain backend rather than hard-failing. This is the outermost of
+    ///    the four fallback layers.
+    #[tokio::test]
+    async fn test_e2e_attestation_and_invoke_fail_falls_back_to_plain_http() {
+        let (e2e_base, _instances, evidence_hits, invoke_hits) =
+            spawn_e2e_mock_with_evidence(json!({"detail": "evidence error"}), 500, 500).await;
+        // Plain backend that serves the request on fallback.
+        let (backend_url, captured) = spawn_capturing_backend().await;
+        let app = test_app_e2e(
+            backend_url,
+            e2e_base,
+            Some("127.0.0.1".into()),
+            vec![tee_model_info()],
+        );
+        let request = request_from_value(json!({
+            "model": "Vendor/Foo-TEE",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }));
+
+        let response = messages_e2e(State(app), auth_headers(), axum::Json(request))
+            .await
+            .unwrap();
+        let (status, _body) = response_text(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            evidence_hits.load(Ordering::SeqCst) >= 1,
+            "evidence endpoint must have been queried"
+        );
+        assert!(
+            invoke_hits.load(Ordering::SeqCst) >= 1,
+            "E2E invoke must have been attempted (and failed)"
+        );
+        assert_eq!(
+            captured.read().await.len(),
+            1,
+            "plain backend must have served the request via the final fallback"
         );
     }
 }
