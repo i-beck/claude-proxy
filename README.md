@@ -316,18 +316,20 @@ Measured on the current 720-test tree with `cargo llvm-cov --release`:
 
 | Scope | Line coverage |
 |---|---|
-| Whole `src/` (incl. the test-only `src/e2ee/`) | **91.98%** (15,899 / 17,286) |
+| Whole `src/` (incl. the E2E module `src/e2ee/`) | **91.98%** (15,899 / 17,286) |
 | `src/` minus `src/e2ee/` (production) | **99.01%** (10,748 / 10,856) |
-| `src/e2ee/` alone (test-only module) | **80.11%** (5,151 / 6,430) |
+| `src/e2ee/` alone (E2E module; live-fetch surfaces sit in `#[ignore]`d tests) | **80.11%** (5,151 / 6,430) |
 
-The whole-repo figure is dragged down by the `src/e2ee/` module (which carries
-heavier test/live-only surfaces); the wiring of E2E into the request path
+The whole-repo figure is dragged down by the E2E module's live-only surfaces:
+`smoke.rs` reads 0% in the default suite because the entire file is
+`#[ignore]`d live tests, and the miner-fetch/DCAP/evidence code in
+`attestation.rs` only reaches its highest coverage during the
+`--include-ignored` ceiling run. The wiring of E2E into the request path
 (`d41bc10`) added ~1,200 lines of new production code, moving the production
 line-coverage baseline from 99.73% → 99.01%. When the live tests are included
 (the reproducible "ceiling" run, 5 flaky/unreachable tests skipped) the
 whole-repo figure rises to ~96% (96.32% per the last reproducible run documented
-in `COVERAGE.md`). The `src/e2ee/smoke.rs` file reads 0% in the default suite
-because the entire file is `#[ignore]`d live tests.
+in `COVERAGE.md`).
 
 Reproduce:
 
